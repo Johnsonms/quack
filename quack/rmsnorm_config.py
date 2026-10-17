@@ -101,24 +101,35 @@ def _for_blackwell_fwd(
 ) -> RmsNormFwdConfig:
     """Pick a launch config for RMSNorm / LayerNorm fwd on Blackwell.
 
-    Starts from the Hopper ladder and changes one knob (measured on GB300,
-    SM103): LayerNorm defers the W/B load past the row reductions when more
-    than one full-row fp32 fragment would otherwise stay live through them.
-    Loaded up front, W and B sit in registers alongside x: bf16 N=16K with a
-    bias hits 255 regs and ~5 GB of local-memory spill traffic per launch.
-    Deferred, bf16 LayerNorm with bias runs 1.10-1.95x faster across
+    Starts from the Hopper ladder and changes two things (measured on GB300,
+    SM103). First, LayerNorm defers the W/B load past the row reductions when
+    more than one full-row fp32 fragment would otherwise stay live through
+    them. Loaded up front, W and B sit in registers alongside x: bf16 N=16K
+    with a bias hits 255 regs and ~5 GB of local-memory spill traffic per
+    launch. Deferred, bf16 LayerNorm with bias runs 1.10-1.95x faster across
     N=1K..256K, and without bias 1.10-1.36x while x itself is kept in
     registers (reload_from=None, N<=16K). fp32 rows gain only with a bias and
     N>8K (1.00-1.27x). With W alone live (no bias, x reloaded; and all of
     RMSNorm) deferring is neutral or worse (fp32 LN 0.86-0.97x, RMSNorm bf16
-    N=16K 0.80x), so those keep the eager load.
+    N=16K 0.80x), so those keep the eager load. Second, fp32 RMSNorm clusters
+    earlier (see below).
     """
     config = _for_hopper_fwd(N, dtype_width, 10, is_layernorm)
     if dtype_width == 16:
         delay_w_load = has_bias or config.reload_from is None
     else:
         delay_w_load = has_bias and N > 8 * 1024
-    return dataclasses.replace(config, delay_w_load=is_layernorm and delay_w_load)
+    config = dataclasses.replace(config, delay_w_load=is_layernorm and delay_w_load)
+    if not is_layernorm and dtype_width == 32 and 8 * 1024 < N <= 128 * 1024:
+        # The Hopper fp32 ladder keeps cluster_n=1 to N=32K, which leaves each
+        # of the 256 threads/row a 512 B fragment (128 fp32). Spread the row
+        # so the fragment is <= 128 B: 1.06x (16K), 1.19x (32K), 1.26x (64K),
+        # 1.20x (128K). N=256K at cn=16 regresses (0.92x), so it keeps cn=8.
+        for limit, cluster_n in [(16 * 1024, 2), (32 * 1024, 4), (64 * 1024, 8), (128 * 1024, 16)]:
+            if N <= limit:
+                config = dataclasses.replace(config, cluster_n=cluster_n)
+                break
+    return config
 
 
 @dataclass(frozen=True)
