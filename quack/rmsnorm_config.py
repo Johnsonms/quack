@@ -81,7 +81,16 @@ def _for_hopper_fwd(
                 cluster_n = cluster
                 break
 
-    reload_threshold = 16 * 1024 if is_layernorm else 8 * 1024
+    if is_layernorm and dtype_width == 16:
+        # The two-pass LayerNorm kernel holds the whole row in registers between
+        # the mean and the variance pass. For 16-bit rows that hits 255 registers
+        # and spills from 8k on (N=16k: 128 elements/thread, ~0.8M local loads);
+        # reloading x from smem is 1.16-1.40x faster on B200 at N=4k..16k and a
+        # wash at 2k. fp32 rows lose 4-9% from the reload below 16k, so they keep
+        # the wider threshold.
+        reload_threshold = 2 * 1024
+    else:
+        reload_threshold = 16 * 1024 if is_layernorm else 8 * 1024
     return RmsNormFwdConfig(
         num_threads=num_threads,
         threads_per_row=threads_per_row,
