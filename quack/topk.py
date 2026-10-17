@@ -269,6 +269,19 @@ def topk_fwd(x: torch.Tensor, k: int, softmax: bool = False):
     values = torch.empty((M, k), dtype=x.dtype, device=x.device)
     indices = torch.empty((M, k), dtype=torch.int32, device=x.device)
     _topk_fwd(x, k, softmax, values, indices)
+    if x.dtype == torch.float32:
+        # The kernel keeps the column index in the low log2(N) mantissa bits of
+        # the fp32 key, so fp32 values come back with those bits overwritten
+        # (and near-ties within 2^-(23 - log2 N) relative may pick a different
+        # element than torch.topk). 16-bit inputs are exact: their mantissa is
+        # zero there. Return the exact selected elements for fp32.
+        values = torch.gather(x, 1, indices.long())
+        # The kernel's order is that of the truncated keys; re-sort the exact
+        # values so the result stays descending (ties keep the kernel's order).
+        values, order = torch.sort(values, dim=-1, descending=True, stable=True)
+        indices = torch.gather(indices, 1, order)
+        if softmax:
+            values = torch.softmax(values, dim=-1)
     return values, indices
 
 
