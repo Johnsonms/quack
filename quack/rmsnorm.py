@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
+import dataclasses
 import math
 from typing import Optional, Tuple, Type
 from functools import partial
@@ -30,6 +31,9 @@ from quack.autotuner import autotune, AutotuneConfig
 from quack.rmsnorm_config import (
     RmsNormBwdConfig,
     RmsNormFwdConfig,
+    _bump_cluster_n_for_smem,
+    _detect_arch_major,
+    _max_cluster_for,
     get_all_bwd_configs,
     get_all_fwd_configs,
     get_sm_count,
@@ -71,6 +75,7 @@ class RMSNorm(ReductionBase):
         is_layernorm: bool = False,
         weight_offset: float = 0.0,
         config: Optional["RmsNormFwdConfig"] = None,
+        res_dtype_width: Optional[int] = None,
     ):
         super().__init__(dtype, N, stage=2 if is_layernorm else 1)
         self.is_layernorm = is_layernorm
@@ -81,6 +86,21 @@ class RMSNorm(ReductionBase):
             config = RmsNormFwdConfig.from_analytical_heuristic(
                 N, dtype.width, is_layernorm=is_layernorm
             )
+            if res_dtype_width is not None:
+                # The heuristic sizes the cluster for one row tile; with a
+                # residual the kernel stages x and the residual side by side,
+                # and fp32 rows from 32k up then overflow smem (2 x 128 KB on a
+                # 227 KB budget) and fail to launch. Widen the cluster until
+                # both tiles fit.
+                cluster_n = _bump_cluster_n_for_smem(
+                    config.cluster_n,
+                    N,
+                    smem_stages=1,
+                    sum_bytes=(dtype.width + res_dtype_width) // 8,
+                    max_cluster=_max_cluster_for(_detect_arch_major()),
+                )
+                if cluster_n != config.cluster_n:
+                    config = dataclasses.replace(config, cluster_n=cluster_n)
         self.config = config
         self.reload_from = config.reload_from
         self.delay_w_load = config.delay_w_load
@@ -455,7 +475,14 @@ def _compile_rmsnorm_fwd(
     rstd_cute = fake_tensor(Float32, batch_shape) if has_rstd else None
     mean_cute = fake_tensor(Float32, batch_shape) if has_mean else None
     return cute.compile(
-        RMSNorm(dtype, N, is_layernorm=is_layernorm, weight_offset=weight_offset, config=config),
+        RMSNorm(
+            dtype,
+            N,
+            is_layernorm=is_layernorm,
+            weight_offset=weight_offset,
+            config=config,
+            res_dtype_width=res_dtype.width if res_dtype is not None else None,
+        ),
         x_cute,
         weight_cute,
         bias_cute,
