@@ -20,7 +20,7 @@ from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 from cutlass.experimental import primitives as prims
 
 from quack import layout_utils
-from quack.utils import make_vector
+from quack.utils import fill_oob, make_vector
 
 
 Sm100MmaPeerBitMask = 0xFEFFFFFF
@@ -304,12 +304,25 @@ def load_t2r(
     return dst
 
 
+def _g2s_copy_op(is_async: bool, num_copy_bits: int):
+    """cp.async only moves 4, 8 or 16 bytes per thread. A 16-bit row whose length
+    shares no factor with the 128-bit vector (odd N: GPT-2's 50257-entry vocab,
+    any odd hidden size) gets a 1-element, 16-bit copy from the gcd vector size,
+    and cp.async with cp_size=16 fails IR verification inside the DSL. Fall back to
+    a plain synchronous copy for anything narrower than 32 bits; the callers'
+    cp_async_commit/wait_group pairs are then no-ops and the barrier that follows
+    them still publishes the smem tile."""
+    if is_async and num_copy_bits >= 32:
+        return cpasync.CopyG2SOp()
+    return cute.nvgpu.CopyUniversalOp()
+
+
 @dsl_user_op
 def get_copy_atom(
     dtype: Type[cutlass.Numeric], num_copy_elems: int, is_async: bool = False, *, loc=None, ip=None
 ) -> cute.CopyAtom:
     num_copy_bits = const_expr(min(128, num_copy_elems * dtype.width))
-    copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
+    copy_op = _g2s_copy_op(is_async, num_copy_bits)
     return cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
 
 
@@ -327,13 +340,17 @@ def copy(
     num_copy_elems = src.shape[0][0]
     copy_atom = get_copy_atom(src.element_type, num_copy_elems, is_async)
     cute.copy(copy_atom, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
+    if const_expr(is_async and pred is not None and num_copy_elems * src.element_type.width < 32):
+        # cp.async zero-fills predicated-off destinations (src-size 0); the
+        # synchronous fallback skips them, so fill the tail explicitly.
+        fill_oob(dst, pred, dst.element_type.zero)
 
 
 def tiled_copy_1d(
     dtype: Type[cutlass.Numeric], num_threads: int, num_copy_elems: int = 1, is_async: bool = False
 ) -> cute.TiledCopy:
     num_copy_bits = num_copy_elems * dtype.width
-    copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
+    copy_op = _g2s_copy_op(is_async, num_copy_bits)
     copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
     thr_layout = cute.make_layout(num_threads)
     val_layout = cute.make_layout(num_copy_elems)
@@ -369,7 +386,7 @@ def tiled_copy_2d(
     is_async: bool = False,
 ) -> cute.TiledCopy:
     num_copy_bits = num_copy_elems * dtype.width
-    copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
+    copy_op = _g2s_copy_op(is_async, num_copy_bits)
     copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
     assert num_threads % threads_per_row == 0
     thr_layout = cute.make_ordered_layout(
