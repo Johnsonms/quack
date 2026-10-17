@@ -34,11 +34,18 @@ class RotaryKernel:
         dim: int,
         interleaved: bool = False,
         conjugate: bool = False,
+        headdim: Optional[int] = None,
     ):
         self.dtype = dtype
         self.dim = dim
         self.interleaved = interleaved
         self.conjugate = conjugate
+        # When headdim > dim (partial rotary, out-of-place), the kernel also streams the
+        # pass-through columns [dim, headdim) from x to out, so the host doesn't need a
+        # separate strided copy for them.
+        self.headdim = headdim if headdim is not None else dim
+        assert self.headdim >= dim
+        self.copy_tail = self.headdim > dim
         self.num_threads = 128
         self.tile_h = 2 if self.dim <= 96 else 1
         multiple = 32 if dim <= 128 else 64
@@ -91,6 +98,18 @@ class RotaryKernel:
             mCos.element_type, threads_per_row_cs, self.num_threads, vecsize_cs
         )
         assert tiler_mn[0] % (self.num_threads // threads_per_row_cs) == 0
+        tiled_copy_tail = None
+        if const_expr(self.copy_tail):
+            tail = self.headdim - self.dim
+            assert tail % vecsize == 0
+            # Power of 2 >= threads_per_row so the tail tile's row count divides tiler_mn[0].
+            threads_per_row_tail = max(math.gcd(32, tail // vecsize), threads_per_row)
+            tile_tail_cols = threads_per_row_tail * vecsize
+            self.tile_tail = (tail + tile_tail_cols - 1) // tile_tail_cols * tile_tail_cols
+            tiled_copy_tail = copy_utils.tiled_copy_2d(
+                mX.element_type, threads_per_row_tail, self.num_threads, vecsize
+            )
+            assert tiler_mn[0] % (self.num_threads // threads_per_row_tail) == 0
 
         # (b, s, h, d) -> (s, d, h, b); (s, h, d) -> (s, d, h)
         x_layout_transpose = [0, 2, 1] if const_expr(self.is_varlen) else [1, 3, 2, 0]
@@ -118,6 +137,7 @@ class RotaryKernel:
             tiler_mn,
             tiled_copy,
             tiled_copy_cs,
+            tiled_copy_tail,
         ).launch(
             grid=[
                 cute.ceil_div(nheads, self.tile_h),
@@ -141,6 +161,7 @@ class RotaryKernel:
         tiler_mn: cute.Shape,
         tiled_copy: cute.TiledCopy,
         tiled_copy_cs: cute.TiledCopy,
+        tiled_copy_tail: Optional[cute.TiledCopy],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         head_idx, m_idx, batch_idx = cute.arch.block_idx()
@@ -213,6 +234,35 @@ class RotaryKernel:
         copy = partial(copy_utils.copy, pred=pred[None, 0, None] if not is_even_dim else None)
         copy_cs = partial(copy_utils.copy, pred=pred_cs[None, 0, None] if not is_even_dim else None)
 
+        if const_expr(self.copy_tail):
+            # Pass-through columns [dim, headdim): plain gmem -> rmem -> gmem copy.
+            tail = self.headdim - self.dim
+            tiler_tail = (tiler_mn[0], self.tile_tail, self.tile_h)
+            gXt = cute.local_tile(
+                cute.domain_offset((0, self.dim, 0), mX_batch), tiler_tail, (m_idx, 0, head_idx)
+            )
+            gOt = cute.local_tile(
+                cute.domain_offset((0, self.dim, 0), mO_batch), tiler_tail, (m_idx, 0, head_idx)
+            )
+            cXt = cute.local_tile(
+                cute.make_identity_tensor((max_seqlen_or_x, self.tile_tail)),
+                (tiler_mn[0], self.tile_tail),
+                (m_idx, 0),
+            )
+            thr_copy_tail = tiled_copy_tail.get_slice(tidx)
+            tTcX_full = thr_copy_tail.partition_S(cXt)
+            tTcX = tTcX_full[(0, None), None, None]
+            tTgX = thr_copy_tail.partition_S(gXt)
+            tTgO = thr_copy_tail.partition_D(gOt)
+            tTrX = cute.make_rmem_tensor_like(tTgX)
+            is_even_tail = const_expr(self.tile_tail == tail)
+            pred_tail = None
+            if const_expr(not is_even_tail):
+                pred_tail = copy_utils.predicate_k(tTcX_full, limit=tail)
+            copy_tail = partial(
+                copy_utils.copy, pred=pred_tail[None, 0, None] if not is_even_tail else None
+            )
+
         tScCosSin = tScCosSin_full[(0, None), None, None]
         for m in cutlass.range(cute.size(tCSgCos, mode=[1]), unroll_full=True):
             row_cs = tScCosSin[0, m, 0][0]
@@ -233,6 +283,13 @@ class RotaryKernel:
                             copy(tXgX[None, m, None, h], tXrX_g2r[None, m, None, h])
             if const_expr(not self.interleaved):
                 cute.arch.cp_async_commit_group()
+
+        if const_expr(self.copy_tail):
+            for h in cutlass.range_constexpr(self.tile_h):
+                if self.tile_h == 1 or h < nheads - head_idx * self.tile_h:
+                    for m in cutlass.range(cute.size(tTgX, mode=[1]), unroll_full=True):
+                        if tTcX[0, m, 0][0] < seq_len:
+                            copy_tail(tTgX[None, m, None, h], tTrX[None, m, None, h])
 
         cos_vals = tCSrCos.load().to(Float32)
         sin_vals = tCSrSin.load().to(Float32)
@@ -284,6 +341,13 @@ class RotaryKernel:
                     if tXcX[0, m, 0][0] < seq_len:
                         copy(tXrX[None, m, None], tXgO[None, m, None, h])
 
+        if const_expr(self.copy_tail):
+            for h in cutlass.range_constexpr(self.tile_h):
+                if self.tile_h == 1 or h < nheads - head_idx * self.tile_h:
+                    for m in cutlass.range(cute.size(tTgO, mode=[1]), unroll_full=True):
+                        if tTcX[0, m, 0][0] < seq_len:
+                            copy_tail(tTrX[None, m, None, h], tTgO[None, m, None, h])
+
     @staticmethod
     @jit_cache
     def compile(
@@ -294,6 +358,7 @@ class RotaryKernel:
         dim,
         interleaved,
         conjugate,
+        headdim=None,
     ):
         is_varlen = cu_seqlens_dtype is not None
         has_seqlen_offsets = seqlen_offsets_dtype is not None
@@ -324,7 +389,7 @@ class RotaryKernel:
         )
         cu_seqlens_cute = fake_tensor(cu_seqlens_dtype, (batch_p1_sym,)) if is_varlen else None
         return cute.compile(
-            RotaryKernel(dtype, dim, interleaved=interleaved, conjugate=conjugate),
+            RotaryKernel(dtype, dim, interleaved=interleaved, conjugate=conjugate, headdim=headdim),
             x_cute,
             cos_cute,
             sin_cute,
@@ -362,6 +427,8 @@ def _launch_rotary(
         torch2cute_dtype_map[seqlen_offsets.dtype] if seqlen_offsets is not None else None
     )
     cu_seqlens_dtype = Int32 if cu_seqlens is not None else None
+    # Out-of-place with rotary_dim < headdim: the kernel also copies x[..., dim:] to out.
+    headdim = x.size(-1) if out.data_ptr() != x.data_ptr() else dim
     RotaryKernel.compile(
         dtype,
         cossin_dtype,
@@ -370,6 +437,7 @@ def _launch_rotary(
         dim,
         interleaved,
         conjugate,
+        headdim,
     )(x, cos, sin, seqlen_offsets, cu_seqlens, out, max_seqlen)
 
 
@@ -505,8 +573,6 @@ def apply_rotary(
 
     cos, sin = _ensure_last_dim_contiguous(cos), _ensure_last_dim_contiguous(sin)
     out = x if inplace else torch.empty_like(x)
-    if rotary_dim < headdim and not inplace:
-        out[..., rotary_dim:].copy_(x[..., rotary_dim:])
     if inplace:
         _rotary_fwd_inplace(
             x,

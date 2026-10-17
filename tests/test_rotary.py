@@ -895,3 +895,41 @@ def test_apply_rotary_bwd_empty():
     grad = torch.empty_like(out)
     out.backward(grad)
     assert x.grad.shape == x.shape and x.grad.numel() == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("interleaved", [False, True])
+@pytest.mark.parametrize(
+    ("headdim", "rotary_dim"),
+    # Tails that are / aren't a multiple of the tail copy tile, plus a long tail.
+    [(128, 64), (128, 8), (136, 24), (72, 16), (80, 32), (192, 64), (512, 64)],
+)
+def test_rotary_partial_tail_passthrough(headdim, rotary_dim, interleaved, dtype):
+    """Out-of-place partial rotary: the kernel streams x[..., rotary_dim:] into out itself.
+
+    The tail must be bit-exact, the rotated part must match the reference, and the input
+    must be left untouched (including a ragged seqlen that doesn't fill the row tile).
+    """
+    torch.manual_seed(0)
+    device = "cuda"
+    batch_size, seqlen, nheads = 2, 61, 3
+    x = torch.randn(batch_size, seqlen, nheads, headdim, dtype=dtype, device=device)
+    x_copy = x.clone()
+    cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
+    out = apply_rotary(x, cos, sin, interleaved=interleaved)
+    assert out.data_ptr() != x.data_ptr()
+    torch.testing.assert_close(x, x_copy, atol=0, rtol=0)
+    torch.testing.assert_close(out[..., rotary_dim:], x[..., rotary_dim:], atol=0, rtol=0)
+    cos_pt, sin_pt = index_cos_sin(cos, sin, None, seqlen)
+    out_pt = apply_rotary_emb_torch(
+        x.float(), cos_pt.float(), sin_pt.float(), interleaved=interleaved
+    ).to(dtype=dtype)
+    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
+    # Backward of the autograd function also takes the out-of-place (conjugate) path.
+    x_grad = x.clone().requires_grad_()
+    out = apply_rotary_emb(x_grad, cos, sin, interleaved=interleaved)
+    dout = torch.randn_like(out)
+    out.backward(dout)
+    torch.testing.assert_close(
+        x_grad.grad[..., rotary_dim:], dout[..., rotary_dim:], atol=0, rtol=0
+    )
