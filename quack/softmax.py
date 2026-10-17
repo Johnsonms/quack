@@ -74,7 +74,7 @@ class Softmax(ReductionBase):
         self._set_cluster_n()
         largest_dtype_width = const_expr(max(t.element_type.width for t in [mX, mO]))
         tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(
-            vecsize=128 // largest_dtype_width
+            vecsize=math.gcd(self.N, 128 // largest_dtype_width)
         )
         num_threads = tiled_copy.size
         self.kernel(mX, mO, tiler_mn, tiled_copy, threads_per_row).launch(
@@ -262,7 +262,7 @@ class SoftmaxBackward(ReductionBase):
         self._set_cluster_n()
         largest_dtype_width = const_expr(max(t.element_type.width for t in [mdY, mY, mdX]))
         tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(
-            vecsize=128 // largest_dtype_width
+            vecsize=math.gcd(self.N, 128 // largest_dtype_width)
         )
         num_threads = tiled_copy.size
         self.kernel(mdY, mY, mdX, tiler_mn, tiled_copy, threads_per_row).launch(
