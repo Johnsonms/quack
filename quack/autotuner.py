@@ -27,6 +27,14 @@ import triton
 
 from . import __version__
 
+try:
+    # cutlass-dsl >= 4.8 raises launch failures (e.g. the launch preflight's
+    # CUDA_LAUNCH_INVALID_CONFIG for an over-budget smem request) as
+    # CUDADialectError, a DSLCudaRuntimeError that is NOT a RuntimeError.
+    from cutlass.base_dsl.common import DSLCudaRuntimeError as _DSLCudaRuntimeError
+except ImportError:
+    _DSLCudaRuntimeError = RuntimeError
+
 
 PACKAGE_NAME = "quack"
 VERSION = __version__
@@ -214,7 +222,7 @@ class Autotuner:
                     extra_kwargs=config.all_kwargs(),
                     quantiles=(0.5, 0.2, 0.8),
                 )
-            except (RuntimeError, MemoryError) as e:
+            except (RuntimeError, MemoryError, _DSLCudaRuntimeError) as e:
                 # Narrow catch: only swallow GPU-side failures (smem
                 # overflow, kernel launch errors, OOM). Programming errors
                 # (TypeError, AssertionError, ValueError from conflict check

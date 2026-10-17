@@ -123,6 +123,38 @@ def test_autotune_wedged_pool_falls_back_in_process(monkeypatch):
     assert len(tuner.configs_timings) == 2
 
 
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="_gpu_warmup needs a GPU")
+def test_autotune_skips_config_raising_dsl_launch_error():
+    """A launch the DSL rejects must cost that config, not the whole sweep.
+
+    cutlass-dsl >= 4.8 reports launch failures (e.g. the launch preflight's
+    CUDA_LAUNCH_INVALID_CONFIG for a smem request over the per-block limit)
+    as CUDADialectError, which derives from DSLCudaRuntimeError rather than
+    RuntimeError. The L2-cold bench path's narrow catch let it escape, so a
+    cold-cache rmsnorm_fwd_tuned call at N=262144 crashed instead of skipping
+    the over-budget configs.
+    """
+    tvm_ffi_provider = pytest.importorskip("cutlass.cutlass_dsl.tvm_ffi_provider")
+    CUDADialectError = getattr(tvm_ffi_provider, "CUDADialectError", None)
+    if CUDADialectError is None:
+        pytest.skip("cutlass-dsl without CUDADialectError")
+    import torch
+
+    from quack.autotuner import Autotuner, AutotuneConfig
+
+    def kernel(x, block: int = 0):
+        if block == 1:
+            raise CUDADialectError("CUDA Error Code: 1")
+        x.add_(1)
+
+    tuner = Autotuner(kernel, key=[], configs=[AutotuneConfig(block=b) for b in (0, 1)])
+    tuner(torch.zeros(1024, device="cuda"))  # no do_bench / hooks -> L2-cold path
+    timings = {c.kwargs["block"]: t for c, t in tuner.configs_timings.items()}
+    assert timings[1][0] == float("inf")
+    assert timings[0][0] < float("inf")
+    assert tuner.cache[next(iter(tuner.cache))].kwargs["block"] == 0
+
+
 @pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="requires CUDA")
 def test_autotuning_does_not_pollute_selective_checkpoint_cache():
     import torch
