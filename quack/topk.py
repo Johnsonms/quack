@@ -511,7 +511,10 @@ def topk_bwd(
         Input gradients tensor of shape (M, N)
     """
     M, k = dvalues.shape
-    dx = torch.zeros((M, N), dtype=dvalues.dtype, device=dvalues.device)
+    # The kernel writes every element of every row (zero-filled smem tile with the k
+    # gradients scattered in, then a full-row copy to gmem), so dx needs no memset:
+    # torch.zeros here was a second full write of dx, as expensive as the kernel.
+    dx = torch.empty((M, N), dtype=dvalues.dtype, device=dvalues.device)
     _topk_bwd(dvalues, values, indices, k, softmax, dx)
     return dx
 

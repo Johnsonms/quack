@@ -134,3 +134,20 @@ def test_topk_bwd_empty():
     indices = torch.empty(0, k, device="cuda", dtype=torch.int32)
     dx = topk_bwd(dvalues, None, indices, N=N)
     assert dx.shape == (0, N)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("N, k", [(64, 8), (1024, 32), (2048, 16), (4096, 128)])
+@pytest.mark.parametrize("M", [1, 37, 199])
+def test_topk_bwd_writes_full_rows(M, N, k, input_dtype):
+    """topk_bwd hands the kernel an uninitialized dx: every element of every row must be
+    written (exactly k non-zeros per row, equal to dvalues at the indices), for row counts
+    that do not fill the last row tile."""
+    torch.random.manual_seed(0)
+    x = torch.randn(M, N, device="cuda", dtype=input_dtype)
+    values, indices = topk_fwd(x, k)
+    dvalues = torch.rand(M, k, device="cuda", dtype=input_dtype) + 1.0  # strictly non-zero
+    dx = topk_bwd(dvalues, None, indices, N=N)
+    assert dx.shape == (M, N)
+    assert torch.equal((dx != 0).sum(dim=-1), torch.full((M,), k, device="cuda", dtype=torch.long))
+    torch.testing.assert_close(torch.gather(dx, 1, indices.long()), dvalues, atol=0, rtol=0)
