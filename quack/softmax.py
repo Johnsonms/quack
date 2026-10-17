@@ -34,6 +34,21 @@ class Softmax(ReductionBase):
         )
         self.online_softmax = online_softmax
 
+    def _wide_row_sm100(self) -> bool:
+        """SM100 16-bit power-of-two rows above 32k: widen the cluster one step
+        earlier and drop to 128 threads per row above 128k. On B200 the generic
+        ladder lands those rows on a 16384-element (32 KB) per-CTA tile, which
+        loses 13-24% to an 8k/12k tile (N=64k: 5.0 -> 6.2 TB/s, 128k: 4.5 -> 5.5,
+        256k: 4.0 -> 4.5). Other widths already sit on smaller tiles and gain
+        nothing (some lose), so they keep the generic ladder."""
+        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+        return (
+            arch.major == 10
+            and self.dtype.width == 16
+            and self.N > 32 * 1024
+            and self.N & (self.N - 1) == 0
+        )
+
     def _threads_per_row(self):
         N = self.N
         for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (16384, 128)]:
@@ -53,6 +68,15 @@ class Softmax(ReductionBase):
         if arch.major == 12 and const_expr(self.dtype.width >= 32):
             # SM12x 99 KB SMEM: fp32 needs tighter clustering (same limits as fp16)
             thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
+        elif self._wide_row_sm100():
+            # Smallest cluster whose per-CTA tile is <= 12k elements (24 KB):
+            # 48k -> 4, 64k/96k -> 8, 128k+ -> 16. Measured on B200: a 16k tile
+            # loses 13-24% to the 8k/12k tile at every width tried, while
+            # a 6k tile loses 7-19% to the 12k tile.
+            self.cluster_n = 1
+            while N // self.cluster_n > 12 * 1024 and self.cluster_n < max_cluster:
+                self.cluster_n *= 2
+            return
         elif const_expr(self.dtype.width == 16):
             thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
         else:
@@ -77,11 +101,24 @@ class Softmax(ReductionBase):
             vecsize=128 // largest_dtype_width
         )
         num_threads = tiled_copy.size
+        # A 16384-element 16-bit row tile on 256 threads compiles to 82 registers,
+        # which the 8-register allocation granularity rounds to 88 and caps the
+        # kernel at 2 CTAs/SM (fp16 lands on 80 and gets 3). Ask ptxas for 3 and
+        # keep the full smem carveout, since min_blocks_per_mp alone makes the DSL
+        # derive a carveout of 3 tiles. Only that tile: on smaller tiles the bound
+        # lets ptxas grow 63 -> 68 registers and costs a 4th CTA (N=48k: 0.85x).
+        cap_regs = const_expr(
+            num_threads == 256 and self.dtype.width == 16 and self.N // self.cluster_n == 16384
+        )
         self.kernel(mX, mO, tiler_mn, tiled_copy, threads_per_row).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
             stream=stream,
+            # min_blocks_per_mp=1 is not a no-op: it also lets ptxas grow the
+            # register count on the smaller tiles (63 -> 68, one CTA/SM fewer).
+            min_blocks_per_mp=3 if cap_regs else 0,
+            preferred_smem_carveout=100 if cap_regs else None,
         )
 
     @cute.kernel
