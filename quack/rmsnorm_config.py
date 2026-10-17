@@ -6,6 +6,7 @@ Mirrors :mod:`quack.gemm_config`: frozen dataclasses that capture the launch
 knobs, plus arch-specific factories that own the heuristics.
 """
 
+import dataclasses
 import itertools
 from dataclasses import dataclass
 from typing import List, Optional
@@ -31,16 +32,20 @@ class RmsNormFwdConfig:
         dtype_width: int,
         arch_major: Optional[int] = None,
         is_layernorm: bool = False,
+        has_bias: bool = False,
     ) -> "RmsNormFwdConfig":
         """Pick a launch config from the hand-tuned analytical heuristic.
 
-        ``arch_major`` defaults to the current device's capability. The same
-        ladder is used for Hopper, Blackwell, and SM12x today; a future
-        ``_for_blackwell_fwd`` factory can be added and dispatched on
-        ``arch_major >= 10``. For autotuning, use :func:`get_all_fwd_configs`.
+        ``arch_major`` defaults to the current device's capability.
+        ``arch_major == 10`` (SM100/SM103) selects the Blackwell heuristic;
+        anything else uses the ladder tuned on Hopper. ``has_bias`` (LayerNorm
+        with a bias tensor) only matters on Blackwell. For autotuning, use
+        :func:`get_all_fwd_configs`.
         """
         if arch_major is None:
             arch_major = _detect_arch_major()
+        if arch_major == 10:
+            return _for_blackwell_fwd(N, dtype_width, is_layernorm, has_bias)
         return _for_hopper_fwd(N, dtype_width, arch_major, is_layernorm)
 
 
@@ -99,6 +104,31 @@ def _for_hopper_fwd(
         reload_from=None if N <= reload_threshold else "smem",
         delay_w_load=False,
     )
+
+
+def _for_blackwell_fwd(
+    N: int, dtype_width: int, is_layernorm: bool, has_bias: bool = False
+) -> RmsNormFwdConfig:
+    """Pick a launch config for RMSNorm / LayerNorm fwd on Blackwell.
+
+    Starts from the Hopper ladder and changes one knob (measured on GB300,
+    SM103): LayerNorm defers the W/B load past the row reductions when more
+    than one full-row fp32 fragment would otherwise stay live through them.
+    Loaded up front, W and B sit in registers alongside x: bf16 N=16K with a
+    bias hits 255 regs and ~5 GB of local-memory spill traffic per launch.
+    Deferred, bf16 LayerNorm with bias runs 1.10-1.95x faster across
+    N=1K..256K, and without bias 1.10-1.36x while x itself is kept in
+    registers (reload_from=None, N<=16K). fp32 rows gain only with a bias and
+    N>8K (1.00-1.27x). With W alone live (no bias, x reloaded; and all of
+    RMSNorm) deferring is neutral or worse (fp32 LN 0.86-0.97x, RMSNorm bf16
+    N=16K 0.80x), so those keep the eager load.
+    """
+    config = _for_hopper_fwd(N, dtype_width, 10, is_layernorm)
+    if dtype_width == 16:
+        delay_w_load = has_bias or config.reload_from is None
+    else:
+        delay_w_load = has_bias and N > 8 * 1024
+    return dataclasses.replace(config, delay_w_load=is_layernorm and delay_w_load)
 
 
 @dataclass(frozen=True)

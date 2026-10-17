@@ -76,6 +76,7 @@ class RMSNorm(ReductionBase):
         weight_offset: float = 0.0,
         config: Optional["RmsNormFwdConfig"] = None,
         res_dtype_width: Optional[int] = None,
+        has_bias: bool = False,
     ):
         super().__init__(dtype, N, stage=2 if is_layernorm else 1)
         self.is_layernorm = is_layernorm
@@ -84,7 +85,7 @@ class RMSNorm(ReductionBase):
         self.weight_offset = weight_offset
         if config is None:
             config = RmsNormFwdConfig.from_analytical_heuristic(
-                N, dtype.width, is_layernorm=is_layernorm
+                N, dtype.width, is_layernorm=is_layernorm, has_bias=has_bias
             )
             if res_dtype_width is not None:
                 # The heuristic sizes the cluster for one row tile; with a
@@ -482,6 +483,7 @@ def _compile_rmsnorm_fwd(
             weight_offset=weight_offset,
             config=config,
             res_dtype_width=res_dtype.width if res_dtype is not None else None,
+            has_bias=bias_dtype is not None,
         ),
         x_cute,
         weight_cute,
