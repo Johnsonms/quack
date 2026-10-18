@@ -34,6 +34,15 @@ class Softmax(ReductionBase):
         )
         self.online_softmax = online_softmax
 
+    @staticmethod
+    def _is_sm100() -> bool:
+        """SM100 (B200/GB200) only. SM103 (B300/GB300) shares ``arch.major == 10``
+        but neither change below helps there: main already runs those rows near
+        bandwidth, the wider cluster is 0.88-0.94x at N=128k (51 -> 40 active
+        clusters), and the register bound makes ptxas spill at N=256k."""
+        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+        return arch.major == 10 and arch.minor == 0
+
     def _wide_row_sm100(self) -> bool:
         """SM100 16-bit power-of-two rows above 32k: widen the cluster one step
         earlier and drop to 128 threads per row above 128k. On B200 the generic
@@ -41,9 +50,8 @@ class Softmax(ReductionBase):
         loses 13-24% to an 8k/12k tile (N=64k: 5.0 -> 6.2 TB/s, 128k: 4.5 -> 5.5,
         256k: 4.0 -> 4.5). Other widths already sit on smaller tiles and gain
         nothing (some lose), so they keep the generic ladder."""
-        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
         return (
-            arch.major == 10
+            self._is_sm100()
             and self.dtype.width == 16
             and self.N > 32 * 1024
             and self.N & (self.N - 1) == 0
@@ -107,8 +115,12 @@ class Softmax(ReductionBase):
         # keep the full smem carveout, since min_blocks_per_mp alone makes the DSL
         # derive a carveout of 3 tiles. Only that tile: on smaller tiles the bound
         # lets ptxas grow 63 -> 68 registers and costs a 4th CTA (N=48k: 0.85x).
+        # Only on SM100: sm_103a already compiles this tile to 80 registers.
         cap_regs = const_expr(
-            num_threads == 256 and self.dtype.width == 16 and self.N // self.cluster_n == 16384
+            self._is_sm100()
+            and num_threads == 256
+            and self.dtype.width == 16
+            and self.N // self.cluster_n == 16384
         )
         self.kernel(mX, mO, tiler_mn, tiled_copy, threads_per_row).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
