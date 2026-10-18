@@ -385,3 +385,25 @@ def test_cross_entropy_bwd_stride0_dloss():
     loss_ref = F.cross_entropy(x_ref, target, reduction="none")
     (dx_ref,) = torch.autograd.grad(loss_ref, x_ref, grad_outputs=torch.ones_like(loss_ref))
     torch.testing.assert_close(dx, dx_ref.to(torch.bfloat16), atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("inplace_backward", [False, True])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+def test_cross_entropy_bwd_strided_x(input_dtype, inplace_backward):
+    """x as a column slice (row stride > N): the bwd kernel must not assume dx shares x's
+    row stride (dx = torch.empty_like(x) is contiguous)."""
+    device = "cuda"
+    M, N, pad = 64, 6144, 64
+    torch.random.manual_seed(0)
+    x_full = 0.1 * torch.randn(M, N + pad, device=device, dtype=input_dtype)
+    x = x_full[:, :N].detach().requires_grad_()
+    assert x.stride() == (N + pad, 1)
+    target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
+    x_ref = x.detach().float().requires_grad_()
+    loss = cross_entropy(x, target, inplace_backward=inplace_backward)
+    loss_ref = F.cross_entropy(x_ref, target)
+    loss.backward()
+    loss_ref.backward()
+    atol = 1e-6 if input_dtype == torch.float32 else 1e-4
+    torch.testing.assert_close(loss, loss_ref, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(x.grad, x_ref.grad.to(input_dtype), atol=atol, rtol=1e-3)

@@ -551,7 +551,10 @@ class CrossEntropyBackward:
     def compile(dtype, target_dtype, N, weight_dtype):
         batch_sym = cute.sym_int()
         div = math.gcd(128 // dtype.width, N)
-        x_cute, dx_cute = [fake_tensor(dtype, (batch_sym, N), div)] * 2
+        # Separate tensors so dx gets its own row stride: x may be a column slice
+        # (row stride > N) while dx = torch.empty_like(x) is contiguous.
+        x_cute = fake_tensor(dtype, (batch_sym, N), div)
+        dx_cute = fake_tensor(dtype, (batch_sym, N), div)
         target_cute = fake_tensor(target_dtype, (batch_sym,))
         dloss_cute = cute.runtime.make_fake_tensor(
             Float32, (batch_sym,), stride=(cute.sym_int64(),)
