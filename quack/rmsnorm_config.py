@@ -129,7 +129,48 @@ class RmsNormBwdConfig:
             arch_major = _detect_arch_major()
         if arch_major >= 10:
             return _for_blackwell_bwd(N, dtype_width, dout_width, T_hint, num_acc)
+        if arch_major == 9 and dtype_width == 16 and dout_width == 16 and N > 4096:
+            return _for_hopper_bwd_16bit(N, num_acc)
         return _for_hopper_bwd(N, dtype_width, arch_major)
+
+
+def _for_hopper_bwd_16bit(N: int, num_acc: int) -> RmsNormBwdConfig:
+    """SM90 RMSNorm/LayerNorm bwd for 16-bit x and dout above 4k.
+
+    The generic ladder below runs 256 threads at 167-204 registers (one CTA/SM,
+    12.5% occupancy) and cluster 16 above 64k, where H100 fits only 7 clusters
+    (112 of 132 SMs). Measured on H100 (M*N = 1-2 G elements): TMA loads alone
+    are 1.11-1.28x at 8k-16k; above 16k, 128-thread CTAs with the smallest
+    cluster that keeps each thread at <= 32 elements are 1.08-1.6x. TMA past
+    80 B/thread (64 B for LayerNorm), or at 80 B without reloading x from smem, spills.
+    """
+    if N <= 16 * 1024:
+        return RmsNormBwdConfig(
+            num_threads=256,
+            threads_per_row=256,
+            cluster_n=1 if N <= 8 * 1024 else 2,
+            reload_wdy=None,
+            reload_x=None,
+            use_tma=True,
+        )
+    for cluster_n in (2, 4, 8, 16):
+        if N // cluster_n <= 128 * 32:
+            threads = 128
+            break
+    else:
+        cluster_n, threads = 16, 256
+    frag_bytes = N // cluster_n // threads * 2
+    # LayerNorm's second fp32 accumulator (db) leaves less room: TMA only to 64 B.
+    use_tma = frag_bytes <= (64 if num_acc >= 2 else 80)
+    return RmsNormBwdConfig(
+        num_threads=threads,
+        threads_per_row=threads,
+        cluster_n=cluster_n,
+        reload_wdy="smem",
+        # LayerNorm carries dw and db partials; with TMA it wants x back from smem.
+        reload_x="smem" if use_tma and (num_acc >= 2 or frag_bytes > 64) else None,
+        use_tma=use_tma,
+    )
 
 
 def _for_hopper_bwd(N: int, dtype_width: int, arch_major: int) -> RmsNormBwdConfig:
