@@ -140,7 +140,8 @@ def _for_blackwell_fwd(
     full-row fragment, and deferring then only pays for 16-bit rows with a
     bias: with a bf16 residual at every N (1.00-1.79x), with an fp32 residual
     from 16K up (1.04-1.35x; 0.76-0.88x below). Without a bias it is
-    0.80-1.04x. Second, fp32 RMSNorm clusters earlier (see below).
+    0.80-1.04x. Second, fp32 RMSNorm clusters earlier (see below). Third, a
+    residual never reloads from smem.
     """
     config = _for_hopper_fwd(N, dtype_width, 10, is_layernorm, res_dtype_width)
     if res_dtype_width is not None:
@@ -166,6 +167,11 @@ def _for_blackwell_fwd(
             if N <= limit:
                 config = dataclasses.replace(config, cluster_n=cluster_n)
                 break
+    if res_dtype_width is not None:
+        # With a residual, keep x and the residual in registers instead of
+        # reloading them from smem: on GB300 never slower and up to 1.27x
+        # (median 1.03-1.11x per dtype/bias class, N=16K..256K).
+        config = dataclasses.replace(config, reload_from=None)
     return config
 
 

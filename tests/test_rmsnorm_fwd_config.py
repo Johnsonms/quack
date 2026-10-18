@@ -57,10 +57,18 @@ def test_layernorm_16bit_residual_keeps_registers(N, arch_major, res_width):
     # With a residual the reload is 0.83-1.00x on GB300: keep the 16k threshold.
     cfg = _fwd(N, 16, ln=True, arch_major=arch_major, res_dtype_width=res_width)
     assert cfg.reload_from is None, (N, arch_major, res_width)
-    assert (
-        _fwd(32768, 16, ln=True, arch_major=arch_major, res_dtype_width=res_width).reload_from
-        == "smem"
-    )
+    wide = _fwd(32768, 16, ln=True, arch_major=arch_major, res_dtype_width=res_width)
+    assert wide.reload_from == (None if arch_major == 10 else "smem")
+
+
+@pytest.mark.parametrize("res_width", [16, 32])
+@pytest.mark.parametrize("dtype_width", [16, 32])
+@pytest.mark.parametrize("ln", [False, True])
+@pytest.mark.parametrize("N", [8192, 16384, 32768, 65536, 131072, 262144])
+def test_blackwell_residual_never_reloads(N, ln, dtype_width, res_width):
+    # GB300, N=16K..256K: keeping x + residual in registers is never slower
+    # than the smem reload (up to 1.27x).
+    assert _fwd(N, dtype_width, ln=ln, res_dtype_width=res_width).reload_from is None
 
 
 @pytest.mark.parametrize("N", [2048, 8192, 16384])
