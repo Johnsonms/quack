@@ -31,21 +31,30 @@ class RmsNormFwdConfig:
         dtype_width: int,
         arch_major: Optional[int] = None,
         is_layernorm: bool = False,
+        has_bias: bool = False,
+        res_dtype_width: Optional[int] = None,
     ) -> "RmsNormFwdConfig":
         """Pick a launch config from the hand-tuned analytical heuristic.
 
         ``arch_major`` defaults to the current device's capability. The same
         ladder is used for Hopper, Blackwell, and SM12x today; a future
         ``_for_blackwell_fwd`` factory can be added and dispatched on
-        ``arch_major >= 10``. For autotuning, use :func:`get_all_fwd_configs`.
+        ``arch_major >= 10``. ``has_bias`` / ``res_dtype_width`` (width of the
+        residual input, ``None`` without one) only matter on SM90 today.
+        For autotuning, use :func:`get_all_fwd_configs`.
         """
         if arch_major is None:
             arch_major = _detect_arch_major()
-        return _for_hopper_fwd(N, dtype_width, arch_major, is_layernorm)
+        return _for_hopper_fwd(N, dtype_width, arch_major, is_layernorm, has_bias, res_dtype_width)
 
 
 def _for_hopper_fwd(
-    N: int, dtype_width: int, arch_major: int, is_layernorm: bool
+    N: int,
+    dtype_width: int,
+    arch_major: int,
+    is_layernorm: bool,
+    has_bias: bool = False,
+    res_dtype_width: Optional[int] = None,
 ) -> RmsNormFwdConfig:
     num_threads = 128 if N <= 16 * 1024 else 256
 
@@ -82,12 +91,27 @@ def _for_hopper_fwd(
                 break
 
     reload_threshold = 16 * 1024 if is_layernorm else 8 * 1024
+    reload_from = None if N <= reload_threshold else "smem"
+    delay_w_load = False
+    if arch_major == 9 and dtype_width == 16 and has_bias:
+        # Weight and bias held next to the row fragment: at >= 96 elements per
+        # thread ptxas falls back to 32 registers with the whole row in local
+        # memory (e.g. LayerNorm N=12288: 85M local loads, 8 ms instead of
+        # 0.55 ms on H100; RMSNorm N=6144: 1.7 ms instead of 0.13 ms). Loading
+        # W/B after the reductions keeps them out of the live range. Without a
+        # residual that also helps whenever the row stays in registers and for
+        # cluster rows (1.03-1.26x); with a residual only the spilling sizes win.
+        elems_per_thread = N // (threads_per_row * cluster_n)
+        if res_dtype_width is None:
+            delay_w_load = reload_from is None or N >= 32 * 1024
+        else:
+            delay_w_load = elems_per_thread >= 96
     return RmsNormFwdConfig(
         num_threads=num_threads,
         threads_per_row=threads_per_row,
         cluster_n=cluster_n,
-        reload_from=None if N <= reload_threshold else "smem",
-        delay_w_load=False,
+        reload_from=reload_from,
+        delay_w_load=delay_w_load,
     )
 
 

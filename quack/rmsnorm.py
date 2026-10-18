@@ -71,6 +71,8 @@ class RMSNorm(ReductionBase):
         is_layernorm: bool = False,
         weight_offset: float = 0.0,
         config: Optional["RmsNormFwdConfig"] = None,
+        has_bias: bool = False,
+        res_dtype_width: Optional[int] = None,
     ):
         super().__init__(dtype, N, stage=2 if is_layernorm else 1)
         self.is_layernorm = is_layernorm
@@ -79,7 +81,11 @@ class RMSNorm(ReductionBase):
         self.weight_offset = weight_offset
         if config is None:
             config = RmsNormFwdConfig.from_analytical_heuristic(
-                N, dtype.width, is_layernorm=is_layernorm
+                N,
+                dtype.width,
+                is_layernorm=is_layernorm,
+                has_bias=has_bias,
+                res_dtype_width=res_dtype_width,
             )
         self.config = config
         self.reload_from = config.reload_from
@@ -455,7 +461,15 @@ def _compile_rmsnorm_fwd(
     rstd_cute = fake_tensor(Float32, batch_shape) if has_rstd else None
     mean_cute = fake_tensor(Float32, batch_shape) if has_mean else None
     return cute.compile(
-        RMSNorm(dtype, N, is_layernorm=is_layernorm, weight_offset=weight_offset, config=config),
+        RMSNorm(
+            dtype,
+            N,
+            is_layernorm=is_layernorm,
+            weight_offset=weight_offset,
+            config=config,
+            has_bias=bias_dtype is not None,
+            res_dtype_width=res_dtype.width if res_dtype is not None else None,
+        ),
         x_cute,
         weight_cute,
         bias_cute,
