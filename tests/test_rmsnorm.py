@@ -458,6 +458,42 @@ def test_rmsnorm_with_bias(use_compile):
     torch.testing.assert_close(bias.grad, bias_ref.grad, atol=1e-4, rtol=1e-3)
 
 
+@pytest.mark.parametrize("use_residual", [False, True])
+@pytest.mark.parametrize("M", [0, 32])
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rmsnorm_bias_without_weight(use_compile, M, use_residual):
+    """bias with weight=None: the backward used to cast db to weight.dtype."""
+    device = "cuda"
+    N = 1024
+    torch.random.manual_seed(0)
+    x = torch.randn(M, N, device=device, dtype=torch.float16, requires_grad=True)
+    bias = torch.randn(N, device=device, dtype=torch.float32, requires_grad=True)
+    residual = (
+        torch.randn(M, N, device=device, dtype=torch.float16, requires_grad=True)
+        if use_residual
+        else None
+    )
+    x_ref = x.detach().clone().requires_grad_()
+    bias_ref = bias.detach().clone().requires_grad_()
+    residual_ref = residual.detach().clone().requires_grad_() if use_residual else None
+
+    function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
+    out = function(x, None, bias=bias, residual=residual, eps=1e-6)
+    out_ref = rmsnorm_ref(x_ref, None, bias=bias_ref, residual=residual_ref, eps=1e-6)
+    if use_residual:
+        out_ref = out_ref[0]
+    grad_out = torch.randn_like(out)
+    out.backward(grad_out)
+    out_ref.backward(grad_out)
+
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
+    assert bias.grad.dtype == torch.float32
+    torch.testing.assert_close(bias.grad, bias_ref.grad, atol=1e-4, rtol=1e-3)
+    if use_residual:
+        torch.testing.assert_close(residual.grad, residual_ref.grad, atol=1e-2, rtol=1e-3)
+
+
 @pytest.mark.parametrize("backward_type", ["only_output", "both"])
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rmsnorm_with_residual(backward_type, use_compile):

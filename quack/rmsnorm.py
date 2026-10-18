@@ -1398,6 +1398,8 @@ def rmsnorm_bwd(
         dw_partial = None
     db_shape = (sm_count, H, N) if per_head else (sm_count, N)
     db_partial = torch.empty(db_shape, device=device, dtype=torch.float32) if has_bias else None
+    # Without a weight there is nothing to match: keep db in the fp32 it is reduced in.
+    db_dtype = weight.dtype if weight is not None else torch.float32
 
     if x.numel() > 0:
         _rmsnorm_bwd(
@@ -1415,10 +1417,10 @@ def rmsnorm_bwd(
         )
         # we have summed the partial gradients in fp32, now we convert back to the weight dtype
         dw = dw_partial.sum(dim=0).to(weight.dtype) if weight is not None else None
-        db = db_partial.sum(dim=0).to(weight.dtype) if has_bias else None
+        db = db_partial.sum(dim=0).to(db_dtype) if has_bias else None
     else:
         dw = torch.zeros_like(weight) if weight is not None else None
-        db = torch.zeros_like(weight) if has_bias else None
+        db = torch.zeros(db_shape[1:], device=device, dtype=db_dtype) if has_bias else None
     # dresidual is the same as dx in this case
     if has_residual and dresidual is None:
         dresidual = dx
