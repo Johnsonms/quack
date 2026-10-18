@@ -414,7 +414,10 @@ def get_all_fwd_configs() -> List[RmsNormFwdConfig]:
     max_cluster = _max_cluster_for(arch_major)
     cluster_vals = tuple(c for c in (1, 2, 4, 8, 16) if c <= max_cluster)
     reload_from_vals = (None, "smem", "gmem")
-    delay_w_load_vals = (False,)
+    # Deferring the W/B load past the reductions only pays when another
+    # full-row fragment would stay live next to x (LayerNorm's bias, or x
+    # itself kept in registers); the pruner drops it for RMSNorm.
+    delay_w_load_vals = (False, True)
 
     configs: List[RmsNormFwdConfig] = []
     for num_threads, threads_per_row, cluster_n, reload_from, delay_w_load in itertools.product(
@@ -511,6 +514,8 @@ def prune_invalid_rmsnorm_fwd_configs(configs, named_args: dict, **kwargs):
     work to do, and a row tile (x, plus the residual) larger than the device's
     opt-in dynamic smem cannot launch. Without the smem check, wide rows compile
     configs that are then rejected at launch (N=262144 bf16: 42 of 75).
+    ``delay_w_load=True`` is kept for LayerNorm only: with nothing but W live
+    next to x (RMSNorm), deferring its load is neutral or slower.
     """
     kwargs = named_args | kwargs
     x = kwargs["x"]
@@ -528,6 +533,8 @@ def prune_invalid_rmsnorm_fwd_configs(configs, named_args: dict, **kwargs):
         if c.threads_per_row * c.cluster_n > N:
             continue
         if smem_max > 0 and _fwd_smem_bytes(c, N, vecsize, tile_bytes, stage) > smem_max:
+            continue
+        if c.delay_w_load and not kwargs.get("is_layernorm", False):
             continue
         pruned.append(ac)
     return pruned

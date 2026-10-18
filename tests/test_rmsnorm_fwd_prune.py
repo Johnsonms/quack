@@ -1,8 +1,9 @@
 """CPU checks for the RMSNorm/LayerNorm fwd autotune pruner's smem guard.
 
 The expected counts were measured on GB300 (sm_103a, 232448 B opt-in smem) by
-launching every config: exactly these many of the 75 configs launch, and the
-pruner keeps exactly those.
+launching every config: exactly these many of the 75 layouts launch, and the
+pruner keeps exactly those. Each layout comes with delay_w_load False and True;
+the pruner keeps the True half for LayerNorm only.
 """
 
 from types import SimpleNamespace
@@ -32,7 +33,7 @@ def _args(N, dtype, res_dtype=None, is_layernorm=False):
 
 def _kept(N, dtype, res_dtype=None, is_layernorm=False):
     configs = [AutotuneConfig(config=c) for c in rc.get_all_fwd_configs()]
-    assert len(configs) == 75
+    assert len(configs) == 150
     return prune_invalid_rmsnorm_fwd_configs(configs, _args(N, dtype, res_dtype, is_layernorm))
 
 
@@ -52,11 +53,14 @@ def _kept(N, dtype, res_dtype=None, is_layernorm=False):
 def test_prune_keeps_exactly_the_launchable_configs(
     blackwell, N, dtype, res_dtype, is_layernorm, n_launchable
 ):
-    assert len(_kept(N, dtype, res_dtype, is_layernorm)) == n_launchable
+    kept = _kept(N, dtype, res_dtype, is_layernorm)
+    assert len(kept) == n_launchable * (2 if is_layernorm else 1)
+    assert any(ac.kwargs["config"].delay_w_load for ac in kept) == is_layernorm
 
 
 def test_prune_keeps_everything_for_narrow_rows(blackwell):
     assert len(_kept(4096, torch.bfloat16, torch.float32)) == 75
+    assert len(_kept(4096, torch.bfloat16, torch.float32, is_layernorm=True)) == 150
 
 
 def test_prune_drops_a_full_row_tile_over_smem(blackwell):
