@@ -7,6 +7,7 @@ knobs, plus arch-specific factories that own the heuristics.
 """
 
 import itertools
+import math
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -488,21 +489,45 @@ def get_all_bwd_configs() -> List[RmsNormBwdConfig]:
     return configs
 
 
+def _fwd_smem_bytes(
+    c: "RmsNormFwdConfig", N: int, vecsize: int, tile_bytes: int, stage: int
+) -> int:
+    """Per-CTA smem of the fwd kernel for config ``c``, mirroring ``RMSNorm``:
+    a ``(rows, tile_n)`` tile per staged tensor (x, plus the residual when there
+    is one) and the cluster reduction buffer (8 B slots) with its mbarriers."""
+    cluster_n = min(c.cluster_n, max(1, (N // vecsize) // c.threads_per_row))  # _cap_cluster_n
+    rows = c.num_threads // c.threads_per_row
+    tile_n = vecsize * -(-(N // vecsize) // (c.threads_per_row * cluster_n)) * c.threads_per_row
+    reduction = (c.num_threads // 32) * cluster_n * stage * 8 + stage * 8
+    return rows * tile_n * tile_bytes + reduction
+
+
 def prune_invalid_rmsnorm_fwd_configs(configs, named_args: dict, **kwargs):
-    """Drop configs whose CTA layout doesn't fit the row width.
+    """Drop configs whose CTA layout doesn't fit the row width or the smem.
 
     The search space (see :func:`get_all_fwd_configs`) is already restricted to
-    the current device's capability, so all that's left is a per-call shape
-    check: ``threads_per_row * cluster_n > N`` would leave cluster CTAs with no
-    work to do, so skip those.
+    the current device's capability, so all that's left is per-call shape
+    checks: ``threads_per_row * cluster_n > N`` would leave cluster CTAs with no
+    work to do, and a row tile (x, plus the residual) larger than the device's
+    opt-in dynamic smem cannot launch. Without the smem check, wide rows compile
+    configs that are then rejected at launch (N=262144 bf16: 42 of 75).
     """
     kwargs = named_args | kwargs
     x = kwargs["x"]
     N = int(x.size(-1))
+    tensors = [kwargs.get(k) for k in ("x", "weight", "bias", "residual", "out", "residual_out")]
+    widths = [t.element_size() * 8 for t in tensors if t is not None]
+    vecsize = math.gcd(N, 128 // max(widths))
+    residual = kwargs.get("residual")
+    tile_bytes = x.element_size() + (residual.element_size() if residual is not None else 0)
+    stage = 2 if kwargs.get("is_layernorm", False) else 1
+    smem_max = _max_dynamic_smem_bytes()
     pruned = []
     for ac in configs:
         c = ac.kwargs["config"]
         if c.threads_per_row * c.cluster_n > N:
+            continue
+        if smem_max > 0 and _fwd_smem_bytes(c, N, vecsize, tile_bytes, stage) > smem_max:
             continue
         pruned.append(ac)
     return pruned
