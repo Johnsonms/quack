@@ -85,7 +85,11 @@ class RMSNorm(ReductionBase):
         self.weight_offset = weight_offset
         if config is None:
             config = RmsNormFwdConfig.from_analytical_heuristic(
-                N, dtype.width, is_layernorm=is_layernorm, has_bias=has_bias
+                N,
+                dtype.width,
+                is_layernorm=is_layernorm,
+                has_bias=has_bias,
+                res_dtype_width=res_dtype_width,
             )
             if res_dtype_width is not None:
                 # The heuristic sizes the cluster for one row tile; with a

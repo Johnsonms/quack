@@ -33,24 +33,30 @@ class RmsNormFwdConfig:
         arch_major: Optional[int] = None,
         is_layernorm: bool = False,
         has_bias: bool = False,
+        res_dtype_width: Optional[int] = None,
     ) -> "RmsNormFwdConfig":
         """Pick a launch config from the hand-tuned analytical heuristic.
 
         ``arch_major`` defaults to the current device's capability.
         ``arch_major == 10`` (SM100/SM103) selects the Blackwell heuristic;
         anything else uses the ladder tuned on Hopper. ``has_bias`` (LayerNorm
-        with a bias tensor) only matters on Blackwell. For autotuning, use
+        with a bias tensor) only matters on Blackwell. ``res_dtype_width`` is the
+        width of the residual input, or ``None`` without one. For autotuning, use
         :func:`get_all_fwd_configs`.
         """
         if arch_major is None:
             arch_major = _detect_arch_major()
         if arch_major == 10:
-            return _for_blackwell_fwd(N, dtype_width, is_layernorm, has_bias)
-        return _for_hopper_fwd(N, dtype_width, arch_major, is_layernorm)
+            return _for_blackwell_fwd(N, dtype_width, is_layernorm, has_bias, res_dtype_width)
+        return _for_hopper_fwd(N, dtype_width, arch_major, is_layernorm, res_dtype_width)
 
 
 def _for_hopper_fwd(
-    N: int, dtype_width: int, arch_major: int, is_layernorm: bool
+    N: int,
+    dtype_width: int,
+    arch_major: int,
+    is_layernorm: bool,
+    res_dtype_width: Optional[int] = None,
 ) -> RmsNormFwdConfig:
     num_threads = 128 if N <= 16 * 1024 else 256
 
@@ -86,15 +92,20 @@ def _for_hopper_fwd(
                 cluster_n = cluster
                 break
 
-    if is_layernorm and dtype_width == 16 and arch_major in (9, 10):
+    if is_layernorm and dtype_width == 16 and arch_major in (9, 10) and res_dtype_width is None:
         # The two-pass LayerNorm kernel holds the whole row in registers between
         # the mean and the variance pass. For 16-bit rows that hits 255 registers
         # and spills at N=16k (128 elements/thread). On B200 reloading x from smem
-        # is 1.16-1.40x faster at N=4k..16k and a wash at 2k. On H100 the rows up
-        # to 8k stay at ~167 registers with no spill and lose ~1% from the reload,
-        # while 10k/16k gain 4-5%, so Hopper reloads only above 8k. fp32 rows lose
-        # 4-9% from the reload below 16k, so they keep the wider threshold.
-        reload_threshold = 8 * 1024 if arch_major == 9 else 2 * 1024
+        # is 1.16-1.40x faster at N=4k..16k and a wash at 2k; on GB300, combined
+        # with the Blackwell deferred W/B load, keeping x in registers still wins
+        # at 3k (1.21x vs 1.00x) and ties at 4k, so Blackwell reloads above 4k.
+        # On H100 the rows up to 8k stay at ~167 registers with no spill and lose
+        # ~1% from the reload, while 10k/16k gain 4-5%, so Hopper reloads only
+        # above 8k. fp32 rows lose 4-9% from the reload below 16k, so they keep
+        # the wider threshold. With a residual the reload is 0.83-1.00x on GB300
+        # (bf16 or fp32 residual, N=4k..16k), so rows with one keep the 16k
+        # threshold as well.
+        reload_threshold = 8 * 1024 if arch_major == 9 else 4 * 1024
     else:
         reload_threshold = 16 * 1024 if is_layernorm else 8 * 1024
     return RmsNormFwdConfig(
@@ -107,7 +118,11 @@ def _for_hopper_fwd(
 
 
 def _for_blackwell_fwd(
-    N: int, dtype_width: int, is_layernorm: bool, has_bias: bool = False
+    N: int,
+    dtype_width: int,
+    is_layernorm: bool,
+    has_bias: bool = False,
+    res_dtype_width: Optional[int] = None,
 ) -> RmsNormFwdConfig:
     """Pick a launch config for RMSNorm / LayerNorm fwd on Blackwell.
 
@@ -121,11 +136,16 @@ def _for_blackwell_fwd(
     registers (reload_from=None, N<=16K). fp32 rows gain only with a bias and
     N>8K (1.00-1.27x). With W alone live (no bias, x reloaded; and all of
     RMSNorm) deferring is neutral or worse (fp32 LN 0.86-0.97x, RMSNorm bf16
-    N=16K 0.80x), so those keep the eager load. Second, fp32 RMSNorm clusters
-    earlier (see below).
+    N=16K 0.80x), so those keep the eager load. A residual adds its own
+    full-row fragment, and deferring then only pays for 16-bit rows with a
+    bias: with a bf16 residual at every N (1.00-1.79x), with an fp32 residual
+    from 16K up (1.04-1.35x; 0.76-0.88x below). Without a bias it is
+    0.80-1.04x. Second, fp32 RMSNorm clusters earlier (see below).
     """
-    config = _for_hopper_fwd(N, dtype_width, 10, is_layernorm)
-    if dtype_width == 16:
+    config = _for_hopper_fwd(N, dtype_width, 10, is_layernorm, res_dtype_width)
+    if res_dtype_width is not None:
+        delay_w_load = dtype_width == 16 and has_bias and (res_dtype_width == 16 or N >= 16 * 1024)
+    elif dtype_width == 16:
         delay_w_load = has_bias or config.reload_from is None
     else:
         delay_w_load = has_bias and N > 8 * 1024
@@ -135,7 +155,14 @@ def _for_blackwell_fwd(
         # of the 256 threads/row a 512 B fragment (128 fp32). Spread the row
         # so the fragment is <= 128 B: 1.06x (16K), 1.19x (32K), 1.26x (64K),
         # 1.20x (128K). N=256K at cn=16 regresses (0.92x), so it keeps cn=8.
-        for limit, cluster_n in [(16 * 1024, 2), (32 * 1024, 4), (64 * 1024, 8), (128 * 1024, 16)]:
+        ladder = [(16 * 1024, 2), (32 * 1024, 4), (64 * 1024, 8), (128 * 1024, 16)]
+        if res_dtype_width == 32:
+            # With an fp32 residual, cn=2 wins at 14K..32K (1.06-1.27x) while cn=4
+            # is 0.93x at 24K, and both lose at 10K/12K (0.83-0.88x) and 64K..128K
+            # (0.83-0.92x). Outside 12K..32K the cluster is only widened as far as
+            # the x and residual tiles need to fit in smem (RMSNorm.__init__).
+            ladder = [(32 * 1024, 2)] if N > 12 * 1024 else []
+        for limit, cluster_n in ladder:
             if N <= limit:
                 config = dataclasses.replace(config, cluster_n=cluster_n)
                 break
