@@ -294,9 +294,14 @@ class CrossEntropy(ReductionBase):
         loss_cute = fake_tensor(Float32, (batch_sym,))
         lse_cute = fake_tensor(Float32, (batch_sym,)) if has_lse else None
         weight_cute = fake_tensor(weight_dtype, (N,)) if weight_dtype is not None else None
-        # If there's dx, it's faster to not use online softmax since we want the exp(x - max)
+        # If there's dx, it's faster to not use online softmax since we want the exp(x - max).
+        # Except on SM100/SM103, where the online reduction (which also returns exp(x - max))
+        # is 1.02-1.24x faster for bf16 and 1.00-1.13x for fp32 at N=4k..256k (GB300): it
+        # replaces the two cluster-wide reductions with one and skips the smem reload above 16k.
+        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+        online_softmax = not has_dx or arch.major == 10
         return cute.compile(
-            CrossEntropy(dtype, N, online_softmax=not has_dx),
+            CrossEntropy(dtype, N, online_softmax=online_softmax),
             x_cute,
             target_cute,
             target_logit_cute,
