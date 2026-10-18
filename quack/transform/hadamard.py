@@ -17,7 +17,11 @@ from cutlass import Boolean, Float32, Int32, const_expr
 from quack import copy_utils, layout_utils
 from quack.cache import jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
-from quack.cute_dsl_utils import get_device_multiprocessor_count, torch2cute_dtype_map
+from quack.cute_dsl_utils import (
+    get_device_capacity,
+    get_device_multiprocessor_count,
+    torch2cute_dtype_map,
+)
 from quack.dsl import cute_op
 
 
@@ -45,6 +49,15 @@ _EPT_BY_N_PADDED = {
     32768: 32,
 }
 assert max(_EPT_BY_N_PADDED) == _MAX_N
+
+# Blackwell (arch major 10) overrides. The table above was tuned on H100, where the kernel is
+# HBM-bound. B200 has about twice the HBM bandwidth per SM-clock, so from N=4K up the kernel is
+# bound by the shared-memory exchanges instead, and fewer, wider stages (larger ept) win:
+# bf16 on B200 1.09-1.24x at N=4K-16K, 1.07x at 32K; fp16 1.05-1.21x. fp32 is already near the
+# clone bound and only 16K gains (1.06x); its other sizes keep the generic table (at 8K ept=64 is
+# 7% slower for fp32 unless rows_per_block is also changed).
+_EPT_BY_N_PADDED_SM100 = {4096: 64, 8192: 64, 16384: 128, 32768: 128}
+_EPT_BY_N_PADDED_SM100_FP32 = {16384: 128}
 
 
 def _next_power_of_2(n: int) -> int:
@@ -308,7 +321,13 @@ class HadamardTransformPlan:
     """
 
     @staticmethod
-    def default_ept_for(N_padded: int) -> int:
+    def default_ept_for(
+        N_padded: int, dtype_width: int | None = None, arch_major: int | None = None
+    ) -> int:
+        if arch_major == 10:
+            table = _EPT_BY_N_PADDED_SM100_FP32 if dtype_width == 32 else _EPT_BY_N_PADDED_SM100
+            if N_padded in table:
+                return table[N_padded]
         return _EPT_BY_N_PADDED[N_padded]
 
     @staticmethod
@@ -333,6 +352,7 @@ class HadamardTransformPlan:
         ept: int | None = None,
         rows_per_block: int | None = None,
         tail_direct_store_enabled: bool | None = None,
+        arch_major: int | None = None,
     ):
         # ── Sizes
         assert 2 <= N <= _MAX_N, f"Hadamard requires 2 <= last dim <= {_MAX_N}"
@@ -342,7 +362,7 @@ class HadamardTransformPlan:
         assert self.N_padded <= _MAX_N, f"Padded Hadamard dim must be <= {_MAX_N}"
 
         if ept is None:
-            ept = self.default_ept_for(self.N_padded)
+            ept = self.default_ept_for(self.N_padded, dtype.width, arch_major)
         assert ept >= 1 and (ept & (ept - 1) == 0), "ept must be a power of 2"
         assert self.N_padded % ept == 0, "Padded Hadamard dimension must be divisible by ept"
         self.ept = ept
@@ -618,8 +638,11 @@ class HadamardTransform:
         ept: int | None = None,
         rows_per_block: int | None = None,
         persistent: bool = False,
+        arch_major: int | None = None,
     ):
-        self.plan = HadamardTransformPlan(dtype, N, ept=ept, rows_per_block=rows_per_block)
+        self.plan = HadamardTransformPlan(
+            dtype, N, ept=ept, rows_per_block=rows_per_block, arch_major=arch_major
+        )
         self.persistent = persistent
         self.async_load = persistent
         self.use_shuffle = N <= 128  # slightly faster to use shuffles than smem for small N
@@ -801,13 +824,13 @@ class HadamardTransform:
 
     @staticmethod
     @jit_cache
-    def compile(dtype, N, persistent: bool = False):
+    def compile(dtype, N, persistent: bool = False, arch_major: int | None = None):
         batch_sym = cute.sym_int()
         div = math.gcd(N, 128 // dtype.width)
         x_cute = fake_tensor(dtype, (batch_sym, N), div)
         out_cute = fake_tensor(dtype, (batch_sym, N), div)
         return cute.compile(
-            HadamardTransform(dtype, N, persistent=persistent),
+            HadamardTransform(dtype, N, persistent=persistent, arch_major=arch_major),
             x_cute,
             out_cute,
             Float32(0.0),
@@ -837,7 +860,8 @@ def _hadamard_transform_fwd(x: Tensor, out: Tensor, scale: float) -> None:
     assert 2 <= N <= _MAX_N, f"Hadamard transform supports last dimension in [2, {_MAX_N}]"
     dtype = torch2cute_dtype_map[x.dtype]
     persistent = _should_use_persistent(x, N)
-    compiled = HadamardTransform.compile(dtype, N, persistent)
+    arch_major = get_device_capacity(x.device)[0]
+    compiled = HadamardTransform.compile(dtype, N, persistent, arch_major)
     num_sms = _get_num_sms(x.device) if persistent else 0
     compiled(x, out, scale, num_sms)
 

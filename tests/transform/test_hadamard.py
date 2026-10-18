@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from quack.transform.hadamard import (
+    HadamardTransformPlan,
     hadamard_transform,
     hadamard_transform_fwd,
     hadamard_transform_ref,
@@ -100,3 +101,24 @@ def test_hadamard_transform_empty_batch():
     x = torch.empty(0, 128, device="cuda", dtype=torch.bfloat16)
     out = hadamard_transform_fwd(x)
     assert out.shape == x.shape and out.numel() == 0
+
+
+@pytest.mark.parametrize(
+    ("N_padded", "dtype_width", "arch_major", "ept"),
+    [
+        (2048, 16, 10, 32),  # below the override range: generic table
+        (4096, 16, 10, 64),
+        (8192, 16, 10, 64),
+        (16384, 16, 10, 128),
+        (32768, 16, 10, 128),
+        (4096, 32, 10, 32),  # fp32: only 16K is overridden
+        (8192, 32, 10, 32),
+        (16384, 32, 10, 128),
+        (32768, 32, 10, 32),
+        (8192, 16, 9, 32),  # Hopper: generic table
+        (16384, 16, 9, 64),
+        (8192, 16, None, 32),  # unknown arch: generic table
+    ],
+)
+def test_hadamard_default_ept_by_arch(N_padded, dtype_width, arch_major, ept):
+    assert HadamardTransformPlan.default_ept_for(N_padded, dtype_width, arch_major) == ept
