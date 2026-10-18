@@ -605,6 +605,7 @@ class RMSNormBackward(ReductionBase):
         is_layernorm: bool = False,
         weight_offset: float = 0.0,
         num_acc: int = 1,
+        has_dresidual: bool = False,
         config: Optional["RmsNormBwdConfig"] = None,
     ):
         # stage counts sync stages: double-buffering across row iterations => 2.
@@ -618,7 +619,12 @@ class RMSNormBackward(ReductionBase):
         dout_width = dout_dtype.width if dout_dtype is not None else dtype.width
         if config is None:
             config = RmsNormBwdConfig.from_analytical_heuristic(
-                N, dtype.width, dout_width, T_hint=T_hint, num_acc=num_acc
+                N,
+                dtype.width,
+                dout_width,
+                T_hint=T_hint,
+                num_acc=num_acc,
+                has_dresidual=has_dresidual,
             )
         self.config = config
         self.reload_wdy = config.reload_wdy
@@ -1329,6 +1335,7 @@ def _compile_rmsnorm_bwd(
             is_layernorm=is_layernorm,
             weight_offset=weight_offset,
             num_acc=int(has_dw_partial) + int(has_db_partial),
+            has_dresidual=dres_out_dtype is not None,
             config=config,
         ),
         x_cute,

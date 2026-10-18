@@ -6,12 +6,12 @@ import pytest
 import torch
 
 from quack.rmsnorm import layernorm_bwd, rmsnorm_bwd
-from quack.rmsnorm_config import RmsNormBwdConfig
+from quack.rmsnorm_config import RmsNormBwdConfig, _for_hopper_bwd
 
 
-def _bwd(N, num_acc, width=16, arch_major=9):
+def _bwd(N, num_acc, width=16, arch_major=9, has_dresidual=False):
     return RmsNormBwdConfig.from_analytical_heuristic(
-        N, width, width, arch_major=arch_major, num_acc=num_acc
+        N, width, width, arch_major=arch_major, num_acc=num_acc, has_dresidual=has_dresidual
     )
 
 
@@ -42,6 +42,21 @@ def test_hopper_layernorm_tma_cap():
     # 163840 is 80 B/thread: RMSNorm takes TMA + x reload, LayerNorm stays on cp.async.
     assert _bwd(163840, 1).use_tma and _bwd(163840, 1).reload_x == "smem"
     assert not _bwd(163840, 2).use_tma
+
+
+@pytest.mark.parametrize("N", [8192, 12288, 16384, 98304, 131072, 163840])
+@pytest.mark.parametrize("num_acc", [1, 2])
+def test_hopper_dresidual_256_thread_rows_match_generic_ladder(N, num_acc):
+    # With a dresidual_out load, TMA at 256 threads is 0.46-0.95x: keep the generic cp.async layout.
+    c = _bwd(N, num_acc, has_dresidual=True)
+    assert c == _for_hopper_bwd(N, 16, 9)
+    assert c.cluster_n == (1 if N <= 8192 else 2 if N <= 16384 else 16)
+
+
+@pytest.mark.parametrize("N", [20480, 32768, 65536])
+def test_hopper_dresidual_keeps_128_thread_rows(N):
+    for num_acc in (1, 2):
+        assert _bwd(N, num_acc, has_dresidual=True) == _bwd(N, num_acc)
 
 
 @pytest.mark.parametrize("N", [4096, 32768, 131072])
@@ -79,3 +94,30 @@ def test_hopper_16bit_bwd_numerics(N, is_layernorm, dtype):
     dx, dw = out[0], out[1]
     torch.testing.assert_close(dx.float(), xf.grad, atol=5e-2, rtol=2e-2)
     torch.testing.assert_close(dw.float(), wf.grad, atol=5e-1, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="exercises the SM90 heuristic",
+)
+@pytest.mark.parametrize("N", [12288, 32768, 98304, 163840])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_hopper_16bit_bwd_dresidual_numerics(N, has_bias, dtype):
+    M = 37
+    torch.manual_seed(0)
+    x = torch.randn(M, N, device="cuda", dtype=dtype)
+    w = torch.randn(N, device="cuda", dtype=torch.float32)
+    dout = torch.randn(M, N, device="cuda", dtype=dtype)
+    dres_out = torch.randn(M, N, device="cuda", dtype=dtype)
+    xf = x.float().requires_grad_()
+    wf = w.clone().requires_grad_()
+    rstd = torch.rsqrt(xf.detach().square().mean(-1) + 1e-6)
+    ref = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + 1e-6) * wf
+    ref.backward(dout.float())
+    dx, dw, db, dres = rmsnorm_bwd(x, w, dout, rstd, dres_out, has_bias=has_bias, has_residual=True)
+    torch.testing.assert_close(dx.float(), xf.grad + dres_out.float(), atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(dres.float(), dx.float())
+    torch.testing.assert_close(dw.float(), wf.grad, atol=5e-1, rtol=1e-2)
+    if has_bias:
+        torch.testing.assert_close(db.float(), dout.float().sum(0), atol=5e-1, rtol=1e-2)

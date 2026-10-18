@@ -115,6 +115,7 @@ class RmsNormBwdConfig:
         arch_major: Optional[int] = None,
         T_hint: int = 0,
         num_acc: int = 1,
+        has_dresidual: bool = False,
     ) -> "RmsNormBwdConfig":
         """Pick a launch config from the hand-tuned analytical heuristic.
 
@@ -123,6 +124,7 @@ class RmsNormBwdConfig:
         uses the legacy/default path tuned on Hopper. ``num_acc`` is the
         number of persistent fp32 row accumulators the kernel carries
         (dw and/or db partials); it drives register-pressure decisions.
+        ``has_dresidual``: the kernel also loads ``dresidual_out``.
         For autotuning, use :func:`get_all_bwd_configs`.
         """
         if arch_major is None:
@@ -130,11 +132,11 @@ class RmsNormBwdConfig:
         if arch_major >= 10:
             return _for_blackwell_bwd(N, dtype_width, dout_width, T_hint, num_acc)
         if arch_major == 9 and dtype_width == 16 and dout_width == 16 and N > 4096:
-            return _for_hopper_bwd_16bit(N, num_acc)
+            return _for_hopper_bwd_16bit(N, num_acc, has_dresidual)
         return _for_hopper_bwd(N, dtype_width, arch_major)
 
 
-def _for_hopper_bwd_16bit(N: int, num_acc: int) -> RmsNormBwdConfig:
+def _for_hopper_bwd_16bit(N: int, num_acc: int, has_dresidual: bool = False) -> RmsNormBwdConfig:
     """SM90 RMSNorm/LayerNorm bwd for 16-bit x and dout above 4k.
 
     The generic ladder below runs 256 threads at 167-204 registers (one CTA/SM,
@@ -143,6 +145,8 @@ def _for_hopper_bwd_16bit(N: int, num_acc: int) -> RmsNormBwdConfig:
     are 1.11-1.28x at 8k-16k; above 16k, 128-thread CTAs with the smallest
     cluster that keeps each thread at <= 32 elements are 1.08-1.6x. TMA past
     80 B/thread (64 B for LayerNorm), or at 80 B without reloading x from smem, spills.
+    With a dresidual_out load, TMA at 256 threads is 0.46-0.95x (12k + bias, 96k-160k), so
+    those rows keep the cp.async layout of the generic ladder; 128-thread rows still win.
     """
     if N <= 16 * 1024:
         return RmsNormBwdConfig(
@@ -151,7 +155,7 @@ def _for_hopper_bwd_16bit(N: int, num_acc: int) -> RmsNormBwdConfig:
             cluster_n=1 if N <= 8 * 1024 else 2,
             reload_wdy=None,
             reload_x=None,
-            use_tma=True,
+            use_tma=not has_dresidual,
         )
     for cluster_n in (2, 4, 8, 16):
         if N // cluster_n <= 128 * 32:
@@ -161,7 +165,7 @@ def _for_hopper_bwd_16bit(N: int, num_acc: int) -> RmsNormBwdConfig:
         cluster_n, threads = 16, 256
     frag_bytes = N // cluster_n // threads * 2
     # LayerNorm's second fp32 accumulator (db) leaves less room: TMA only to 64 B.
-    use_tma = frag_bytes <= (64 if num_acc >= 2 else 80)
+    use_tma = frag_bytes <= (64 if num_acc >= 2 else 80) and not (has_dresidual and threads == 256)
     return RmsNormBwdConfig(
         num_threads=threads,
         threads_per_row=threads,
