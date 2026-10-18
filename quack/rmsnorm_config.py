@@ -163,6 +163,19 @@ def _for_hopper_bwd_16bit(N: int, num_acc: int, has_dresidual: bool = False) -> 
             break
     else:
         cluster_n, threads = 16, 256
+        if num_acc >= 2 and N > 16 * 256 * 48 and N % (16 * 512 * 8) == 0:
+            # With db's fp32 accumulator on top of dw, 64 elements per thread spill hard (262144:
+            # 86M local loads vs 10M without db). 512 threads halve the fragment; capped at 128
+            # registers they still spill a little, and TMA there is 3-7x slower: 1.1-1.49x.
+            # Only for whole 8-element vectors per thread (229376 -> 28 elements: up to 0.43x).
+            return RmsNormBwdConfig(
+                num_threads=512,
+                threads_per_row=512,
+                cluster_n=16,
+                reload_wdy="smem",
+                reload_x=None,
+                use_tma=False,
+            )
     frag_bytes = N // cluster_n // threads * 2
     # LayerNorm's second fp32 accumulator (db) leaves less room: TMA only to 64 B.
     use_tma = frag_bytes <= (64 if num_acc >= 2 else 80) and not (has_dresidual and threads == 256)
