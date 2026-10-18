@@ -18,7 +18,7 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.reduction_base import ReductionBase
 from quack.reduce import row_reduce
 from quack.cache import jit_cache
-from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.cute_dsl_utils import ensure_vectorizable, torch2cute_dtype_map
 from quack.dsl import cute_op
 from quack.sort.bitonic_sort import bitonic_topk
 
@@ -265,6 +265,7 @@ def topk_fwd(x: torch.Tensor, k: int, softmax: bool = False):
     Returns:
         Tuple of (values tensor of shape (M, k), indices tensor of shape (M, k))
     """
+    x = ensure_vectorizable(x)
     M = x.size(0)
     values = torch.empty((M, k), dtype=x.dtype, device=x.device)
     indices = torch.empty((M, k), dtype=torch.int32, device=x.device)

@@ -25,7 +25,7 @@ from quack.pipeline import make_pipeline_state, PipelineStasAsync
 from quack.reduce import row_reduce
 from quack.reduction_base import ReductionBase
 from quack.cache import jit_cache
-from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.cute_dsl_utils import ensure_vectorizable, torch2cute_dtype_map
 from quack.autotuner import autotune, AutotuneConfig
 from quack.rmsnorm_config import (
     RmsNormBwdConfig,
@@ -55,12 +55,10 @@ def _bucket_T_hint(T_hint: int) -> int:
 
 
 def _ensure_contiguous(t):
-    """Ensure last-dim stride is 1. Under torch.compile use unconditional .contiguous()
-    (dynamo can't inspect strides on fake tensors); otherwise check first to avoid copies.
-    """
-    if torch.compiler.is_compiling():
-        return t.contiguous()
-    return t if t.stride(-1) == 1 else t.contiguous()
+    """Ensure the kernel can vectorize ``t`` (last-dim stride 1, aligned row strides/pointer);
+    copy otherwise. Under torch.compile use unconditional .contiguous() (dynamo can't inspect
+    strides on fake tensors)."""
+    return ensure_vectorizable(t)
 
 
 class RMSNorm(ReductionBase):
@@ -484,6 +482,7 @@ def rmsnorm_fwd(
     # Need to wrap to handle the case where residual_out is a alias of x, which makes torch.library
     # and torch.compile unhappy. Also allocate memory for out and residual_out if they are None
     # so that _layer_norm_fwd_impl doesn't have to return them.
+    x, residual = _ensure_contiguous(x), _ensure_contiguous(residual)
     out_dtype = x.dtype if out_dtype is None else out_dtype
     out = torch.empty_like(x, dtype=out_dtype)
     rstd = torch.empty(*x.shape[:-1], device=x.device, dtype=torch.float32) if store_rstd else None
@@ -1357,6 +1356,7 @@ def rmsnorm_bwd(
     has_residual: bool = False,
     weight_offset: float = 0.0,
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
+    x, dout, dresidual_out = [_ensure_contiguous(t) for t in (x, dout, dresidual_out)]
     device = x.device
     N = x.size(-1)
     per_head = x.dim() == 3
@@ -1769,6 +1769,7 @@ def layernorm_fwd(
         assert bias.dim() == 1, "Bias must be 1D"
         assert bias.dtype == torch.float32, "Bias must be float32"
 
+    x = _ensure_contiguous(x)
     M, N = x.shape
     device = x.device
     out = torch.empty_like(x)
@@ -1811,6 +1812,7 @@ def layernorm_bwd(
     """
     assert x.dim() == 2, "Input must be 2D"
     assert weight.dim() == 1, "Weight must be 1D"
+    x, dout = _ensure_contiguous(x), _ensure_contiguous(dout)
     device = x.device
     N = x.size(-1)
     dx = torch.empty_like(x)

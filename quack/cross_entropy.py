@@ -22,7 +22,7 @@ from quack.dsl import cute_op
 from quack.reduce import row_reduce, online_softmax_reduce
 from quack.reduction_base import ReductionBase
 from quack.cache import jit_cache
-from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.cute_dsl_utils import ensure_vectorizable, torch2cute_dtype_map
 from cutlass.base_dsl.enums import Arch
 
 
@@ -375,6 +375,7 @@ def cross_entropy_fwd(
     return_dx: bool = False,
     inplace_backward: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor]:
+    x = ensure_vectorizable(x)
     M = x.size(0)
     device = x.device
     loss = torch.empty(M, device=device, dtype=torch.float32)
@@ -551,7 +552,7 @@ class CrossEntropyBackward:
     def compile(dtype, target_dtype, N, weight_dtype):
         batch_sym = cute.sym_int()
         div = math.gcd(128 // dtype.width, N)
-        x_cute, dx_cute = [fake_tensor(dtype, (batch_sym, N), div)] * 2
+        x_cute, dx_cute = [fake_tensor(dtype, (batch_sym, N), div) for _ in range(2)]
         target_cute = fake_tensor(target_dtype, (batch_sym,))
         dloss_cute = cute.runtime.make_fake_tensor(
             Float32, (batch_sym,), stride=(cute.sym_int64(),)
@@ -638,6 +639,7 @@ def cross_entropy_bwd(
     ignore_index: int = -100,
     inplace_backward: bool = False,
 ) -> None:
+    x = ensure_vectorizable(x)
     if inplace_backward and not torch.compiler.is_compiling():
         dx = x
         _cross_entropy_backward(

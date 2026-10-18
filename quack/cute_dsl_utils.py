@@ -4,6 +4,7 @@ from typing import Tuple, get_origin
 from functools import lru_cache
 from dataclasses import dataclass, fields
 
+import math
 import os
 import re
 
@@ -68,6 +69,32 @@ torch2cute_dtype_map = {
     torch.int32: Int32,
     torch.int64: Int64,
 }
+
+
+def ensure_vectorizable(t: torch.Tensor | None, vec_bytes: int = 16) -> torch.Tensor | None:
+    """Return ``t``, or a contiguous copy if the compiled kernel's layout assumptions don't hold.
+
+    Kernels are compiled against fake tensors (see ``compile_utils.make_fake_tensor``) whose
+    last dim has stride 1 and whose other strides and base pointer are multiples of the vector
+    width, ``gcd(vec_bytes, N * itemsize)`` bytes. A view that violates this (transposed
+    input, a column slice with an odd row stride, a pointer offset by a few elements) would
+    otherwise fail at launch with a CuTe-DSL ``ValueError`` ("Invalid strides" / "Misaligned
+    Tensor data"). Under torch.compile strides can't be inspected, so the copy is unconditional.
+    """
+    if t is None:
+        return None
+    if torch.compiler.is_compiling():
+        return t.contiguous()
+    itemsize = t.element_size()
+    align = math.gcd(vec_bytes, t.shape[-1] * itemsize) if t.dim() > 0 else vec_bytes
+    if (
+        t.stride(-1) == 1
+        and t.data_ptr() % align == 0
+        and all(s * itemsize % align == 0 for s, n in zip(t.stride()[:-1], t.shape[:-1]) if n > 1)
+    ):
+        return t
+    # .contiguous() returns self for a contiguous-but-misaligned tensor, so clone in that case.
+    return t.contiguous() if not t.is_contiguous() else t.clone()
 
 
 @lru_cache

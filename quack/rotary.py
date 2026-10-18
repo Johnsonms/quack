@@ -16,15 +16,14 @@ from cutlass import Float32, Int32, const_expr
 from quack import copy_utils
 from quack.cache import jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
-from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.cute_dsl_utils import ensure_vectorizable, torch2cute_dtype_map
 from quack.dsl import cute_op
 
 
 def _ensure_last_dim_contiguous(t: Tensor) -> Tensor:
-    """Ensure last-dim stride is 1 while avoiding copies for strided-but-row-contiguous inputs."""
-    if torch.compiler.is_compiling():
-        return t.contiguous()
-    return t if t.stride(-1) == 1 else t.contiguous()
+    """Ensure the kernel can vectorize ``t`` (last-dim stride 1, aligned strides/pointer) while
+    avoiding copies for strided-but-row-contiguous inputs such as q/k/v views of a packed qkv."""
+    return ensure_vectorizable(t)
 
 
 class RotaryKernel:
@@ -504,6 +503,8 @@ def apply_rotary(
     assert seqlen_ro >= seqlen, "seqlen_ro must be >= seqlen"
 
     cos, sin = _ensure_last_dim_contiguous(cos), _ensure_last_dim_contiguous(sin)
+    if not inplace:
+        x = _ensure_last_dim_contiguous(x)
     out = x if inplace else torch.empty_like(x)
     if rotary_dim < headdim and not inplace:
         out[..., rotary_dim:].copy_(x[..., rotary_dim:])

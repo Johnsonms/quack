@@ -19,7 +19,7 @@ from quack.dsl import cute_op
 from quack.reduce import row_reduce, online_softmax_reduce
 from quack.reduction_base import ReductionBase
 from quack.cache import jit_cache
-from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.cute_dsl_utils import ensure_vectorizable, torch2cute_dtype_map
 from cutlass.base_dsl.enums import Arch
 
 
@@ -208,6 +208,7 @@ def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
 
 
 def softmax_fwd(x: torch.Tensor) -> torch.Tensor:
+    x = ensure_vectorizable(x)
     out = torch.empty_like(x)
     _softmax_fwd(x, out)
     return out
@@ -392,6 +393,7 @@ def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> No
 
 
 def softmax_bwd(dy: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    dy, y = ensure_vectorizable(dy), ensure_vectorizable(y)
     dx = torch.empty_like(dy)
     _softmax_backward(dy, y, dx)
     return dx
