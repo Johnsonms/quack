@@ -165,6 +165,33 @@ def _for_hopper_bwd(N: int, dtype_width: int, arch_major: int) -> RmsNormBwdConf
     )
 
 
+def bwd_ptxas_options(
+    config: RmsNormBwdConfig,
+    N: int,
+    dtype_width: int,
+    dout_width: int,
+    num_acc: int,
+    arch_major: Optional[int] = None,
+) -> str:
+    """Extra ``cute.compile`` options for the RMSNorm/LayerNorm bwd kernel.
+
+    On SM90, 16-bit rows with the dw + db accumulators and more than 48
+    elements per thread need far more than 255 registers; ptxas -O2/-O3 then
+    often gives up and allocates 32 registers with a ~2 KB stack (~40 GB of
+    local-memory traffic per launch, 4-6x slower). ptxas -O1 keeps 255
+    registers. At exactly 48 or 64 elements per thread, and without db, -O1 is
+    neutral to slower, so those keep the default.
+    """
+    if arch_major is None:
+        arch_major = _detect_arch_major()
+    if arch_major != 9 or dtype_width != 16 or dout_width != 16 or num_acc < 2:
+        return ""
+    elems_per_thread = N / (min(config.cluster_n, 16) * config.threads_per_row)
+    if elems_per_thread > 48 and elems_per_thread != 64:
+        return " --ptxas-options=-O1"
+    return ""
+
+
 def _for_blackwell_bwd(
     N: int, dtype_width: int, dout_width: int, T_hint: int = 0, num_acc: int = 1
 ) -> RmsNormBwdConfig:
