@@ -224,15 +224,17 @@ def bwd_ptxas_options(
     elements per thread need far more than 255 registers; ptxas -O2/-O3 then
     often gives up and allocates 32 registers with a ~2 KB stack (~40 GB of
     local-memory traffic per launch, 4-6x slower). ptxas -O1 keeps 255
-    registers. At exactly 48 or 64 elements per thread, and without db, -O1 is
-    neutral to slower, so those keep the default.
+    registers. Without db the same happens above 64 elements per thread (rms
+    with dresidual_out from N=270336, the rest from 286720-319488), and -O1 is
+    0.96-1.2x where it does not. At exactly 48 or 64 elements per thread, and
+    without db at 48-64, -O1 is neutral to slower, so those keep the default.
     """
     if arch_major is None:
         arch_major = _detect_arch_major()
-    if arch_major != 9 or dtype_width != 16 or dout_width != 16 or num_acc < 2:
+    if arch_major != 9 or dtype_width != 16 or dout_width != 16:
         return ""
     elems_per_thread = N / (min(config.cluster_n, 16) * config.threads_per_row)
-    if elems_per_thread > 48 and elems_per_thread != 64:
+    if elems_per_thread > 64 or (num_acc >= 2 and 48 < elems_per_thread < 64):
         return " --ptxas-options=-O1"
     return ""
 
