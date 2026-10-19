@@ -30,6 +30,7 @@ from quack.autotuner import autotune, AutotuneConfig
 from quack.rmsnorm_config import (
     RmsNormBwdConfig,
     RmsNormFwdConfig,
+    bwd_ptxas_options,
     get_all_bwd_configs,
     get_all_fwd_configs,
     get_sm_count,
@@ -1325,19 +1326,23 @@ def _compile_rmsnorm_bwd(
     dw_shape = (batch_partial_sym, head_sym, N) if per_head else (batch_partial_sym, N)
     dw_partial_cute = fake_tensor(Float32, dw_shape, div) if has_dw_partial else None
     db_partial_cute = fake_tensor(Float32, dw_shape, div) if has_db_partial else None
+    num_acc = int(has_dw_partial) + int(has_db_partial)
+    op = RMSNormBackward(
+        dtype,
+        N,
+        dout_dtype=dout_dtype,
+        T_hint=T_hint,
+        per_head=per_head,
+        is_layernorm=is_layernorm,
+        weight_offset=weight_offset,
+        num_acc=num_acc,
+        has_dresidual=dres_out_dtype is not None,
+        config=config,
+    )
+    dout_width = (dout_dtype or dtype).width
+    ptxas_opts = bwd_ptxas_options(op.config, N, dtype.width, dout_width, num_acc)
     return cute.compile(
-        RMSNormBackward(
-            dtype,
-            N,
-            dout_dtype=dout_dtype,
-            T_hint=T_hint,
-            per_head=per_head,
-            is_layernorm=is_layernorm,
-            weight_offset=weight_offset,
-            num_acc=int(has_dw_partial) + int(has_db_partial),
-            has_dresidual=dres_out_dtype is not None,
-            config=config,
-        ),
+        op,
         x_cute,
         weight_cute,
         dout_cute,
@@ -1350,7 +1355,7 @@ def _compile_rmsnorm_bwd(
         db_partial_cute,
         0,  # sm_count, just for compilation
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
+        options="--enable-tvm-ffi" + ptxas_opts,
     )
 
 
