@@ -151,7 +151,9 @@ class Softmax(ReductionBase):
                 hook_fn=cute.arch.cluster_wait if const_expr(self.cluster_n > 1) else None,
             )
             log2_e = math.log2(math.e)
-            exp_x = cute.math.exp2(x * log2_e - (max_x * log2_e), fastmath=True)
+            # Subtract before scaling (see online_softmax_reduce): the FMA form loses
+            # precision for very negative maxima (rows filled with e.g. -1e10).
+            exp_x = cute.math.exp2((x - max_x) * log2_e, fastmath=True)
             denom = row_reduce(
                 exp_x,
                 cute.ReductionOp.ADD,

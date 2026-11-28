@@ -125,3 +125,76 @@ def test_softmax_bwd_empty():
     y = torch.empty(0, N, device="cuda", dtype=torch.bfloat16)
     dx = softmax_bwd(dy, y)
     assert dx.shape == dy.shape and dx.numel() == 0
+
+
+def _masked_logits(M, N, dtype, fill, pattern):
+    torch.random.manual_seed(0)
+    x = 4.0 * torch.randn(M, N, device="cuda", dtype=torch.float32)
+    keep = torch.zeros(M, N, dtype=torch.bool, device="cuda")
+    if pattern == "first16":  # every warp / CTA but the first sees only fills
+        keep[:, :16] = True
+    elif pattern == "last16":  # the last CTA holds every kept value
+        keep[:, -16:] = True
+    else:  # top-k style: ~20 kept values scattered over the row
+        keep = torch.rand(M, N, device="cuda") < 20.0 / N
+        keep[:, 0] = True
+    return x.masked_fill(~keep, fill).to(dtype)
+
+
+# Rows with large masked regions (top-k / top-p masks in samplers). Before the fix,
+# any warp or cluster CTA that saw only fills returned NaN for the whole row:
+# -inf - (-inf) for -inf fills, and an FMA rounding error of ~2^9 (exp2 -> inf) for
+# fills around -1e10. N spans the single-CTA, multi-warp and cluster paths, plus
+# vocab sizes (151936 = Qwen) where the last cluster CTA only holds the -inf fill of
+# out-of-bounds columns (all-NaN for 16-bit inputs before the fix).
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("N", [4096, 32000, 32768, 151552, 151936, 152064, 262144])
+@pytest.mark.parametrize("fill", [float("-inf"), -1e10, -1e4])
+@pytest.mark.parametrize("pattern", ["first16", "last16", "topk"])
+def test_softmax_masked(input_dtype, N, fill, pattern):
+    M = 4
+    x = _masked_logits(M, N, input_dtype, fill, pattern)
+    out = softmax_fwd(x)
+    out_ref = torch.softmax(x.float(), dim=-1).to(input_dtype)
+    assert not torch.isnan(out).any()
+    atol, rtol = TOLERANCES[input_dtype]
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
+    sums = out.float().sum(dim=-1)
+    torch.testing.assert_close(sums, torch.ones_like(sums), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("N", [4096, 32000, 151936])
+def test_softmax_fully_masked_rows(input_dtype, N):
+    """A row of only -inf is NaN (as torch); a row of only finite fills is uniform."""
+    x = 4.0 * torch.randn(3, N, device="cuda", dtype=torch.float32)
+    x[1] = float("-inf")
+    x[2] = -1e4
+    x = x.to(input_dtype)
+    out = softmax_fwd(x)
+    out_ref = torch.softmax(x.float(), dim=-1).to(input_dtype)
+    assert torch.isnan(out[1]).all() and torch.isnan(out_ref[1]).all()
+    assert not torch.isnan(out[[0, 2]]).any()
+    atol, rtol = TOLERANCES[input_dtype]
+    torch.testing.assert_close(out[[0, 2]], out_ref[[0, 2]], atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("N", [151552, 151936, 152064, 248320])
+@pytest.mark.parametrize("M", [1, 37])
+def test_softmax_vocab_sizes(M, N, input_dtype):
+    """Unmasked rows at LLM vocab sizes, forward and backward."""
+    torch.random.manual_seed(0)
+    x = (4.0 * torch.randn(M, N, device="cuda", dtype=torch.float32)).to(input_dtype)
+    x.requires_grad_()
+    x_ref = x.detach().clone().requires_grad_(True)
+    out = softmax(x)
+    out_ref = F.softmax(x_ref.float(), dim=-1).to(input_dtype)
+    dy = torch.randn_like(out)
+    torch.cuda.synchronize()
+    (dx,) = torch.autograd.grad(out, x, grad_outputs=dy)
+    (dx_ref,) = torch.autograd.grad(out_ref, x_ref, grad_outputs=dy)
+    assert not torch.isnan(out).any()
+    atol, rtol = TOLERANCES[input_dtype]
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(dx, dx_ref, atol=atol, rtol=rtol)

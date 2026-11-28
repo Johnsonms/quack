@@ -12,6 +12,8 @@ from cutlass.experimental import primitives as prims
 
 import quack.utils as utils
 
+FLOAT32_MAX = 3.4028234663852886e38
+
 
 _operator_max = getattr(operator, "max", None)
 _operator_min = getattr(operator, "min", None)
@@ -285,8 +287,16 @@ def online_softmax_reduce(
         threads_in_group=min(threads_per_row, cute.arch.WARP_SIZE),
         dtype=Float32,
     )
+    # A warp (or CTA) whose elements are all -inf (masked logits, or the -inf fill of
+    # out-of-bounds columns) has max -inf: -inf - (-inf) would make its exp and sum NaN,
+    # and that NaN reaches the whole row through the cross-warp / cluster rescale.
+    # Clamping to the lowest finite float keeps exp(-inf - max) = 0 and every rescale
+    # factor exp(max_i - max_final) in [0, 1].
+    max_x = cute.arch.fmax(max_x, Float32(-FLOAT32_MAX))
     log2_e = math.log2(math.e)
-    exp_x = cute.math.exp2(x * log2_e - (max_x * log2_e), fastmath=True)
+    # Subtract before scaling: x * log2_e - max_x * log2_e contracts to an FMA whose
+    # rounding error grows with |max_x| (about 2^9 for max_x = -1e10, so exp2 -> inf).
+    exp_x = cute.math.exp2((x - max_x) * log2_e, fastmath=True)
     sum_exp_x = cute.arch.warp_reduction(
         exp_x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
         operator.add,
