@@ -221,34 +221,41 @@ Cold runs cost ≈ warm + compile-critical-path (measured: warm 26 s, cold 29–
 in-session for a 398-test / 130-key set); warm runs submit nothing and pay nothing
 beyond one idle sidecar import in the background.
 
-### Single-process mode (`_SingleProcDeferLoop`)
+### The runner (`_DeferAndRetry`), single process and xdist alike
 
-Replaces `pytest_runtestloop` with a deque: a deferred test rotates to the back
-(reports discarded, no logging) and is retried once its sha resolves — *without*
-re-running the test until then (rotation is a poll, not a re-run). Fixture-teardown
-scoping is handled by a misprediction guard in `_run_protocol`: `runtestprotocol`
-scopes teardown to a *predicted* next item, deferral breaks the prediction chain, and
-pytest asserts on the mismatch ("previous item was not torn down properly") — so the
-guard forces a full teardown whenever the actually-run item differs from the
-prediction.
+The session's test loop — pytest's own, or xdist's `WorkerInteractor` — calls
+`pytest_runtest_protocol` for each test. The plugin wraps that call (a wrapper that
+encloses pytest's builtin ones): it first retries the deferred tests whose kernel is
+ready, then runs the test.
 
-### xdist mode (`_XdistWorkerDefer`)
-
-xdist's `WorkerInteractor` owns the runtestloop but invokes `pytest_runtest_protocol`
-as a hook, so the plugin takes over the protocol (tryfirst + firstresult):
-
-- A deferred item is stashed; the worker still sends `runtest_protocol_complete`, the
-  master marks the item complete (order-independent `.remove()`) and **keeps streaming
-  new items — skip-ahead comes for free**.
-- Stashed items are retried opportunistically between incoming items, and drained in a
-  `pytest_runtestloop` hookwrapper after xdist's inner loop exits (channel still open,
-  late reports flow normally). Late reports temporarily repoint
-  `WorkerInteractor.item_index` (the worker asserts report↔index consistency).
-- The drain is skipped on `-x`/`--maxfail` aborts.
-- Deferral suppresses the call phase cheaply (`force_result`, avoiding ~100 ms of
-  failure-`longrepr` formatting per deferral) but leaves a setup-phase `CompilePending`
-  as a failure so pytest skips the body on half-built fixtures. Teardown errors on
-  deferred attempts are still forwarded.
+- A deferred attempt's reports are discarded (no logging) and the test is retried once
+  its sha resolves — *without* re-running it until then (a poll, not a re-run). Under
+  xdist the worker still sends `runtest_protocol_complete`, the master marks the item
+  complete (order-independent `.remove()`) and **keeps streaming new items — skip-ahead
+  comes for free**. Late reports temporarily repoint `WorkerInteractor.item_index`
+  (the worker asserts report↔index consistency).
+- Each attempt has a `pytest_runtest_protocol` hook call of its own, never nested in
+  another test's: the loop's call for a first attempt, one the runner makes for a
+  retry. pytest's per-test wrappers (warnings capture and filters, assertion hooks,
+  faulthandler timeout) apply to that test alone, and other plugins' wrappers see each
+  attempt once. The hook's result carries nothing (a wrapper may drop it): an attempt
+  logs or defers itself.
+- Tests still deferred when the loop ends are retried in a `pytest_runtestloop` wrapper
+  (an xdist worker's channel is still open, so late reports flow normally). After a
+  stop (`-x`/`--maxfail`, possibly by a failing retry), nothing more runs.
+- Wedge escape: a test whose kernel has polled "pending" for `_WEDGE_TIMEOUT_S` since
+  its deferral is retried with the pool suppressed (in-process compile). Only time
+  spent pending counts, not time waiting for a retry.
+- Fixture-teardown scoping: `runtestprotocol` scopes teardown to a *predicted* next
+  item, a retry breaks the prediction chain, and pytest asserts on the mismatch
+  ("previous item was not torn down properly"), so the runner forces a full teardown
+  whenever the item run differs from the prediction, as a teardown of the last test
+  run (plain pytest runs those finalizers there): their warnings and errors are
+  reported under that test.
+- Deferral makes the call phase a pass (avoiding ~100 ms of failure-`longrepr`
+  formatting per deferral) but leaves a setup-phase `CompilePending` a failure so
+  pytest skips the body on half-built fixtures. Teardown errors on deferred attempts
+  are still forwarded.
 
 ### Session-end integrity check
 
@@ -298,7 +305,7 @@ pytest --async-compile=32
   └─ pytest_configure: activate(pool), pool.prewarm()   # sidecar import overlaps collection
        └─ test runs, kernel dispatch → jit_cache miss
             ├─ submit pickled (_compile_*, args) to pool → raise CompilePending
-            ├─ defer loop: rotate test to back, run other tests
+            ├─ runner: stash the test, run other tests, retry it once its .o lands
             ├─ pool worker (forked, GPU-blind): _compile_*(...) → export .o
             └─ retry: .o fast path (~1ms) → kernel launches → asserts run
   └─ pytest_sessionfinish: collected-vs-reported integrity check
@@ -311,7 +318,7 @@ pytest --async-compile=32
 | `quack/cache/jit.py` | `@jit_cache` (in-memory + `.o` disk cache), `FileLock`, pool integration (step 3b) |
 | `quack/cache/async_compile.py` | `CompilePending`, `CompilePool`, forkserver sidecar, `pool_scope`, `suppress_pool`, `_neutral_main` |
 | `quack/cache/_pool_preload.py` | forkserver preload: arch pinning (no CUDA), torch/cutlass import |
-| `quack/testing/pytest_plugin.py` | `--async-compile` flag, single-proc + xdist defer loops, integrity check |
+| `quack/testing/pytest_plugin.py` | `--async-compile` flag, the defer-and-retry runner (single process and xdist), integrity check |
 | `autotuner.py` | bench loop under `pool_scope` (compile/bench overlap), `FileCacheManager` result cache |
 | `quack/dsl/torch_library_op.py` | `cute_op`: custom_op with pure no-op fakes |
 | `tests/test_async_compile.py`, `tests/test_autotuner.py`, `tests/test_cache.py` | regression tests encoding the failure modes above |

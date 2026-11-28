@@ -287,16 +287,33 @@ def jit_cache(fn):
             else:  # "failed"
                 pool.noticed.add(sha)
                 fallback = ("worker_failed", str(err))
-                # warnings.warn, not print: this fires inside a test whose stdout
-                # pytest captures and discards on pass (the in-process fallback
-                # usually succeeds), so a print never reaches the user — the
-                # warning lands in pytest's warnings summary instead.
-                warnings.warn(
-                    f"quack cache: async compile failed for {fn.__qualname__} "
-                    f"[{sha[:12]}]: {err}; recompiling in-process for a real traceback",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+
+        def compile_in_process():
+            """``fn(*args, **kwargs)``, reporting a kernel the active pool should
+            have compiled. Only a compile that succeeds here is one the pool
+            missed: a key that fails here too (e.g. a config a test expects to
+            be rejected) just raises, carrying the worker's error as a note."""
+            t0 = time.monotonic()
+            try:
+                compiled_fn = fn(*args, **kwargs)
+            except Exception as e:
+                if fallback is not None and fallback[0] == "worker_failed":
+                    e.add_note(f"quack cache: the async compile worker failed too: {fallback[1]}")
+                raise
+            if fallback is not None:
+                _async.record_fallback(sha, fn.__qualname__, *fallback, time.monotonic() - t0)
+                if fallback[0] == "worker_failed":
+                    # warnings.warn, not print: this fires inside a test whose
+                    # stdout pytest captures and discards on pass, so a print
+                    # never reaches the user — the warning lands in pytest's
+                    # warnings summary instead.
+                    warnings.warn(
+                        f"quack cache: async compile failed for {fn.__qualname__} "
+                        f"[{sha[:12]}]: {fallback[1]}; compiled in-process instead",
+                        RuntimeWarning,
+                        stacklevel=3,
+                    )
+            return compiled_fn
 
         # 4. Slow path: take EXCLUSIVE lock and compile under it. The recheck
         #    inside the lock catches the race where another process compiled
@@ -321,10 +338,7 @@ def jit_cache(fn):
                 stacklevel=2,
             )
             misses += 1
-            t0 = time.monotonic()
-            compiled_fn = fn(*args, **kwargs)
-            if fallback is not None:
-                _async.record_fallback(sha, fn.__qualname__, *fallback, time.monotonic() - t0)
+            compiled_fn = compile_in_process()
             cache[cache_key] = compiled_fn
             return compiled_fn
         try:
@@ -339,13 +353,7 @@ def jit_cache(fn):
                     return loaded
 
             misses += 1
-            t0 = time.monotonic()
-            compiled_fn = fn(*args, **kwargs)
-            # Recorded only when the in-process compile succeeds: a kernel
-            # that fails here too (e.g. a config the test expects to be
-            # rejected) is not something the pool missed.
-            if fallback is not None:
-                _async.record_fallback(sha, fn.__qualname__, *fallback, time.monotonic() - t0)
+            compiled_fn = compile_in_process()
             # Export to a private temp file, then atomically rename into
             # place: a process killed mid-export (xdist worker OOM-kill,
             # timeout) must never leave a truncated .o at the final path —

@@ -15,17 +15,20 @@ To opt in, add this line to your ``conftest.py``::
 
 from __future__ import annotations
 
+import functools
 import inspect
 import os
 import re
 import time
 import traceback
 import warnings
-from collections import Counter, deque
+from collections import Counter, defaultdict
+from contextlib import nullcontext
 
 import pytest
 import torch
-from _pytest.runner import runtestprotocol
+from _pytest.runner import get_reraise_exceptions, runtestprotocol
+from _pytest.warnings import catch_warnings_for_item
 
 from quack.cache.async_compile import (
     CompilePending,
@@ -35,14 +38,6 @@ from quack.cache.async_compile import (
     get_active_pool,
     suppress_pool,
 )
-
-
-# Saved originals so ``pytest_unconfigure`` can restore pytest internals we
-# monkey-patched in ``pytest_configure``. Set to ``None`` when the
-# corresponding patch was skipped (e.g. pytest internals didn't match what
-# we expected, or the env-var opt-out was set).
-_orig_compat_getfuncargnames = None
-_orig_fixtures_getfuncargnames = None
 
 
 def pytest_addoption(parser):
@@ -69,6 +64,16 @@ def pytest_addoption(parser):
             "report their real results)."
         ),
     )
+
+
+# --- pytest speedups (independent of --async-compile) --------------------------
+
+# Saved originals so ``pytest_unconfigure`` can restore pytest internals we
+# monkey-patched in ``pytest_configure``. Set to ``None`` when the
+# corresponding patch was skipped (e.g. pytest internals didn't match what
+# we expected, or the env-var opt-out was set).
+_orig_compat_getfuncargnames = None
+_orig_fixtures_getfuncargnames = None
 
 
 def _install_getfuncargnames_cache() -> None:
@@ -218,6 +223,9 @@ def _disable_unused_accelerator_lazy_call() -> None:
         torch.mtia._lazy_call = nop
 
 
+# --- Session setup and teardown -----------------------------------------------
+
+
 def pytest_configure(config):
     """Set up the async compile pool and pytest-internal speedup patches."""
     jobs = config.getoption("--async-compile", default=None)
@@ -239,10 +247,7 @@ def pytest_configure(config):
             n_workers = int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1"))
             pool = activate(max(2, jobs // n_workers))
             pool.prewarm()  # sidecar import overlaps collection, not the first miss
-            if worker is not None:
-                config.pluginmanager.register(_XdistWorkerDefer(pool), "quack-xdist-defer")
-            else:
-                config.pluginmanager.register(_SingleProcDeferLoop(pool), "quack-defer-loop")
+            config.pluginmanager.register(_DeferAndRetry(pool, config), "quack-defer")
 
     # Speed up manual_seed by short-circuiting the queued-seed path on
     # unavailable accelerators.
@@ -259,9 +264,7 @@ def pytest_unconfigure(config):
     pool = get_active_pool()
     if pool is not None:
         stats = pool.stats()
-        defer_plugin = config.pluginmanager.get_plugin(
-            "quack-defer-loop"
-        ) or config.pluginmanager.get_plugin("quack-xdist-defer")
+        defer_plugin = config.pluginmanager.get_plugin("quack-defer")
         defers = defer_plugin.defer_count if defer_plugin else 0
         summary = (
             f"async-compile: {stats['submitted']} keys submitted, "
@@ -288,86 +291,62 @@ def pytest_unconfigure(config):
     _restore_getfuncargnames_cache()
 
 
-# --- CompilePending deferral hooks ------------------------------------------
+# --- CompilePending: defer the attempt ----------------------------------------
 
 
-def _defer_compile_pending_call(item, outcome, exc):
+def _defer_compile_pending_call(item, exc: CompilePending) -> None:
+    """Defer ``item`` on ``exc``, which its call phase raised and the caller
+    swallows. The retry starts from scratch, so free this attempt's locals
+    now. Swallowing the exception doesn't break this cycle:
+      exception -> traceback -> pluggy frame -> exception
+                       |
+                       +-------> test frame -> GPU tensors
+    so without clearing, the memory would wait for cyclic GC."""
     item._quack_pending_sha = exc.sha
-    outcome.force_result(None)
-    # Dropping the exception from the outcome doesn't break this cycle:
-    #   exception -> traceback -> Pluggy frame -> exception
-    #                    |
-    #                    +-------> test frame -> GPU tensors
-    # The retry starts from scratch. Clear unwound locals so PyTorch can
-    # reuse the tensor memory now instead of waiting for cyclic GC.
     traceback.clear_frames(exc.__traceback__)
     exc.__traceback__ = None
 
 
-def _defer_if_compile_pending(item, outcome, force_pass: bool) -> bool:
-    """If the phase raised CompilePending, flag the item for deferral.
-
-    ``force_pass=True`` (call phase): convert the outcome to a pass. The
-    defer loop discards all reports of a deferred attempt anyway, and
-    letting the exception stand would make pytest build a full failure
-    ``longrepr`` (source-loading traceback format, ~100 ms) for every
-    deferral — measured to nearly double a cold run's in-session time.
-
-    ``force_pass=False`` (setup phase): leave the exception so the phase
-    reports as failed and pytest skips the call phase — half-built fixtures
-    must not run the test body. Setup-phase compiles are rare, so the
-    longrepr cost is negligible there.
-    """
-    excinfo = outcome.excinfo
-    if excinfo is None:
-        return False
-    exc = excinfo[1]
-    if not isinstance(exc, CompilePending):
-        return False
-    if force_pass:
-        _defer_compile_pending_call(item, outcome, exc)
-    else:
-        item._quack_pending_sha = exc.sha
-    return True
-
-
-@pytest.hookimpl(hookwrapper=True)
+@pytest.hookimpl(wrapper=True)
 def pytest_runtest_setup(item):
-    outcome = yield
-    _defer_if_compile_pending(item, outcome, force_pass=False)
+    try:
+        return (yield)
+    except CompilePending as exc:
+        # Stays a setup failure, so pytest skips the body (its fixtures are
+        # half built). The attempt's reports are discarded anyway.
+        item._quack_pending_sha = exc.sha
+        raise
 
 
-@pytest.hookimpl(hookwrapper=True)
+@pytest.hookimpl(wrapper=True)
 def pytest_runtest_call(item):
-    outcome = yield
-    _defer_if_compile_pending(item, outcome, force_pass=True)
+    try:
+        return (yield)
+    except CompilePending as exc:
+        # Made a pass: the attempt's reports are discarded anyway, and a
+        # failure would have pytest format a full traceback for every
+        # deferral (~100 ms each, nearly doubling a cold run).
+        _defer_compile_pending_call(item, exc)
 
 
-# --- Async compile pool: defer-and-retry run loop ---------------------------
+# --- Defer and retry -----------------------------------------------------------
 #
-# With --async-compile, jit_cache misses raise CompilePending after shipping
-# the key to a CPU subprocess pool. A deferred test's reports are discarded
-# (no logging) and the test is retried once its pending sha completes;
-# everything else runs and reports normally. Tests that keep deferring past
-# _MAX_ATTEMPTS run one final attempt with the pool suppressed (in-process
-# compile) so persistent failures surface as ordinary test failures.
+# With --async-compile, a jit_cache miss ships the compile to the CPU worker
+# pool and raises CompilePending, which defers the attempt (hooks above).
+# _DeferAndRetry discards a deferred attempt's reports and retries the test
+# once its kernel is ready, while the session runs other tests meanwhile.
 #
-# Two execution modes:
-#
-# * Single-process pytest: ``_SingleProcDeferLoop`` replaces the default
-#   ``pytest_runtestloop`` with a deque that rotates deferred items to the
-#   back.
-#
-# * xdist worker: xdist's ``WorkerInteractor`` owns the runtestloop, but it
-#   invokes ``pytest_runtest_protocol`` as a hook, so ``_XdistWorkerDefer``
-#   takes over the protocol (tryfirst + firstresult). Deferred items are
-#   stashed; the master receives ``runtest_protocol_complete`` immediately
-#   (its ``mark_test_complete`` is a plain order-independent ``.remove()``)
-#   and keeps streaming new items to the worker -- skip-ahead for free.
-#   Stashed items are opportunistically re-run between incoming items as
-#   their compiles finish, and fully drained in a ``pytest_runtestloop``
-#   hookwrapper after xdist's inner loop exits (channel still open, so late
-#   reports flow to the master normally).
+# The session's test loop (pytest's own, or an xdist worker's) calls
+# pytest_runtest_protocol for each test in turn. _DeferAndRetry wraps that
+# call: it first retries the deferred tests whose kernel is ready, then runs
+# the test itself. Each attempt has a hook call of its own, never nested in
+# another test's (the loop's call, or one a retry makes), so pytest's per-test
+# wrappers apply to that test alone, and other plugins' wrappers see each
+# attempt once. Under xdist, the master hears the protocol complete at
+# once, deferred or not (its mark_test_complete is an order-independent
+# .remove()), so it keeps the worker fed; a retried test's reports reach it
+# later. Tests still deferred when the loop ends are retried after it,
+# waiting on the pool (an xdist worker's channel is still open then).
 
 # A test needing K distinct cold kernels defers K times (keys are discovered
 # serially: each attempt stops at the first missing kernel). Attempts are
@@ -377,265 +356,185 @@ def pytest_runtest_call(item):
 # defer a test forever.
 _MAX_ATTEMPTS = 20
 
-# The item that the most recent runtestprotocol call *predicted* would run
-# next (its ``nextitem``). Fixture teardown is scoped to that prediction
-# (``SetupState.teardown_exact``), and pytest asserts the prediction was
-# right at the next setup ("previous item was not torn down properly").
-# Deferral breaks the chain — a drained item can run while the fixture stack
-# is scoped for a different module — so ``_run_protocol`` detects the
-# misprediction and forces a full teardown first.
-_LAST_PREDICTED_NEXT = [None]
+
+def _warnings_of(item):
+    """pytest's warnings capture for ``item``: its filters, its nodeid."""
+    if item is None or not item.config.pluginmanager.has_plugin("warnings"):
+        return nullcontext()
+    return catch_warnings_for_item(item.config, item.ihook, "runtest", item)
 
 
-def _run_protocol(item, nextitem, force_sync: bool):
-    """Run one test protocol without logging. Returns (pending_sha, reports)."""
-    if _LAST_PREDICTED_NEXT[0] is not item:
-        ss = item.session._setupstate
-        if ss.stack:
-            ss.teardown_exact(None)
-    _LAST_PREDICTED_NEXT[0] = nextitem
-
-    item._quack_pending_sha = None
-    if force_sync:
-        with suppress_pool():
-            reports = runtestprotocol(item, nextitem=nextitem, log=False)
-    else:
-        reports = runtestprotocol(item, nextitem=nextitem, log=False)
-    pending_sha = getattr(item, "_quack_pending_sha", None)
-    # Kernels this attempt compiled in-process although the pool was active.
-    # Kept on the item across deferred attempts (their reports are dropped)
-    # and attached to the reports that are logged: user_properties travel
-    # with the report, so they reach the xdist controller too.
-    item._quack_fallbacks = getattr(item, "_quack_fallbacks", []) + [
-        list(f) for f in drain_fallbacks()
-    ]
-    awaited = getattr(item, "_quack_awaited", [])
-    if pending_sha:
-        item._quack_awaited = awaited + [pending_sha]
-    elif reports:
-        # Kernels this test waited for that failed in the pool and that it
-        # then PASSED without asking for again: built by nobody. (A retry
-        # that fails or skips says nothing about the kernel.)
-        pool = get_active_pool()
-        passed = pool is not None and all(report.passed for report in reports)
-        for sha in awaited if passed else ():
-            orphan = pool.orphaned(sha)
-            if orphan is not None:
-                item._quack_fallbacks.append([sha, orphan[0], "never_built", orphan[1], 0.0])
-        if item._quack_fallbacks:
-            reports[-1].user_properties.append((_FALLBACK_PROP, item._quack_fallbacks))
-        item._quack_fallbacks, item._quack_awaited = [], []
-    return pending_sha, reports
+def _stopped(session) -> bool:
+    """A test stopped the session: -x, --maxfail (under xdist, the master's)."""
+    return bool(session.shouldfail or session.shouldstop)
 
 
-def _log_reports(item, reports):
-    ihook = item.ihook
-    ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
-    for rep in reports:
-        ihook.pytest_runtest_logreport(report=rep)
-    ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
+class _DeferAndRetry:
+    """The --async-compile test runner, in a single process or an xdist worker."""
 
-
-def _log_deferred_teardown_errors(item, reports, log_fn):
-    """Surface real teardown failures from an otherwise-discarded attempt.
-
-    A deferred attempt's reports are dropped (the retry produces the ones
-    that count), but the attempt's teardown *did run* — an error there is a
-    genuine bug (leaked fixture state) that the retry may not reproduce.
-    Forward just the failed teardown report so it isn't silently hidden.
-    """
-    for rep in reports:
-        if rep.when == "teardown" and rep.failed:
-            log_fn(item, [rep])
-
-
-class _SingleProcDeferLoop:
-    """Custom runtestloop for non-xdist runs: defer = rotate to back of deque."""
-
-    def __init__(self, pool):
-        self.pool = pool
-        self.defer_count = 0
-
-    #: How long a deferred test may wait on its pool compile before the loop
-    #: stops trusting the pool and re-runs it with the pool suppressed
-    #: (in-process compile). Guards against a permanently-"pending" sha
-    #: (wedged worker, foreign flock holder that never produces the .o) —
-    #: without it a rotation-only item would spin forever, since attempts
-    #: increment only on actual runs. It applies only while the awaited sha
-    #: still polls "pending": a deferred test waits at the back of the queue,
-    #: so in a long session its turn comes long after its compile finished,
-    #: and that queue time says nothing about the pool.
+    #: How long a deferred test may wait on a kernel that stays "pending"
+    #: before it is retried with the pool suppressed (in-process compile): a
+    #: wedged worker, or a foreign flock holder that never produces the .o,
+    #: must not hold the session forever. Counted from the deferral, and only
+    #: while the kernel polls "pending": a retry may come long after its
+    #: kernel is ready, and that says nothing about the pool. Class attribute
+    #: so the regression tests can shrink it.
     _WEDGE_TIMEOUT_S = 600.0
 
-    @pytest.hookimpl(tryfirst=True)
-    def pytest_runtestloop(self, session):
-        if session.config.option.collectonly:
-            return None
-        queue = deque(session.items)
-        attempts: Counter = Counter()
-        deadline: dict = {}  # nodeid -> wedge deadline for the awaited sha
-        spins = 0  # consecutive queue rotations without running anything
-        while queue:
-            item = queue.popleft()
-            awaiting = getattr(item, "_quack_await_sha", None)
-            wedged = False
-            if awaiting is not None and self.pool.poll(awaiting)[0] == "pending":
-                wedged = time.monotonic() > deadline[item.nodeid]
-                if not wedged:
-                    queue.append(item)
-                    spins += 1
-                    if spins >= len(queue):
-                        time.sleep(0.2)  # everything is blocked on the pool
-                        spins = 0
-                    continue
-            spins = 0
-            attempts[item.nodeid] += 1
-            nextitem = queue[0] if queue else None
-            pending_sha, reports = _run_protocol(
-                item, nextitem, force_sync=wedged or attempts[item.nodeid] > _MAX_ATTEMPTS
-            )
-            if pending_sha:
-                item._quack_await_sha = pending_sha
-                deadline[item.nodeid] = time.monotonic() + self._WEDGE_TIMEOUT_S
-                _log_deferred_teardown_errors(item, reports, _log_reports)
-                queue.append(item)
-                self.defer_count += 1
-                continue
-            item._quack_await_sha = None
-            _log_reports(item, reports)
-            if session.shouldstop:
-                raise session.Interrupted(session.shouldstop)
-            if session.shouldfail:
-                raise session.Failed(session.shouldfail)
+    def __init__(self, pool, config):
+        self.pool = pool
+        self.config = config
+        self.deferred = []  # (item, awaited sha, wedge deadline)
+        self.attempts = Counter()  # item -> attempts run
+        self.fallbacks = defaultdict(list)  # item -> kernels the pool did not compile, so far
+        self.awaited = defaultdict(list)  # item -> shas its attempts deferred on
+        self.defer_count = 0
+        self.retrying = False  # in a retry's hook call, from _retry_ready
+        self.wedged = False  # ... of a test whose kernel stayed pending too long
+        self.predicted_next = None  # see _teardown_if_mispredicted
+        self.last_run = None
+
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
+    def pytest_runtest_protocol(self, item, nextitem):
+        if not self.retrying:
+            # The session loop's call for its next test. Registered after
+            # pytest's builtin plugins, this wrapper encloses their per-test
+            # wrappers (warnings capture and filters, assertion hooks,
+            # faulthandler timeout): retry the ready deferred tests before any
+            # of those is active for this test, each in a hook call of its own.
+            self._retry_ready(nextitem=item)
+            self._teardown_if_mispredicted(item)
+        return (yield)
+
+    # (pytest only registers attributes named pytest_*, whatever specname says)
+    @pytest.hookimpl(tryfirst=True, specname="pytest_runtest_protocol")
+    def pytest_quack_attempt(self, item, nextitem):
+        """One attempt of ``item``: log its reports, or defer it again.
+
+        Wedged or past _MAX_ATTEMPTS, it runs with the pool suppressed: its
+        kernels compile in-process, and it can't defer.
+        """
+        if _stopped(item.session):
+            return True  # e.g. -x, and a retry just before this test failed
+        self.attempts[item] += 1
+        force_sync = self.wedged or self.attempts[item] > _MAX_ATTEMPTS
+        self.predicted_next, self.last_run = nextitem, item
+        item._quack_pending_sha = None
+        with suppress_pool() if force_sync else nullcontext():
+            reports = runtestprotocol(item, nextitem=nextitem, log=False)
+        pending_sha = item._quack_pending_sha
+        # Kept across deferred attempts (their reports are dropped) and
+        # attached to the reports that are logged: user_properties travel
+        # with a report, so they reach the xdist controller too.
+        self.fallbacks[item] += [list(f) for f in drain_fallbacks()]
+        if pending_sha:
+            self.awaited[item].append(pending_sha)
+            self.deferred.append((item, pending_sha, time.monotonic() + self._WEDGE_TIMEOUT_S))
+            self.defer_count += 1
+            # The attempt's teardown did run: an error there is a real bug
+            # (leaked fixture state) that the retry may not reproduce.
+            failed_teardown = [r for r in reports if r.when == "teardown" and r.failed]
+            if failed_teardown:
+                self._log(item, failed_teardown)
+            return True
+        fallbacks = self.fallbacks.pop(item)
+        awaited = self.awaited.pop(item, [])
+        if all(report.passed for report in reports):
+            # Kernels this test waited for that failed in the pool and that it
+            # then passed without asking for again: built by nobody. (A retry
+            # that fails or skips says nothing about the kernel.)
+            for sha in awaited:
+                orphan = self.pool.orphaned(sha)
+                if orphan is not None:
+                    fallbacks.append([sha, orphan[0], "never_built", orphan[1], 0.0])
+        if fallbacks:
+            reports[-1].user_properties.append((_FALLBACK_PROP, fallbacks))
+        self._log(item, reports)
         return True
 
-
-class _XdistWorkerDefer:
-    """Defer-and-retry inside an xdist worker.
-
-    The worker's ``run_one_test`` sends ``runtest_protocol_complete`` to the
-    master right after our protocol hook returns -- including for deferred
-    attempts. That is what we want: the master stops tracking the item and
-    keeps the worker's queue full. The item is then entirely this worker's
-    responsibility; we re-run it once its compile lands and forward the
-    reports late (the master's report handling is order-independent).
-    """
-
-    #: See _SingleProcDeferLoop._WEDGE_TIMEOUT_S — same guard for the final
-    #: drain. Class attribute so the regression test can shrink it.
-    _WEDGE_TIMEOUT_S = 600.0
-
-    def __init__(self, pool):
-        self.pool = pool
-        self.deferred = []  # list of (item, awaited_sha)
-        self.attempts = {}  # nodeid -> int
-        self.defer_count = 0
-        self._interactor = None
-
-    def _get_interactor(self, item):
-        """Find xdist's WorkerInteractor (it registers itself as a plugin)."""
-        if self._interactor is None:
-            for p in item.config.pluginmanager.get_plugins():
-                if type(p).__name__ == "WorkerInteractor":
-                    self._interactor = p
-                    break
-        return self._interactor
-
-    def _log_reports_as(self, item, reports) -> None:
-        """Forward reports with the interactor's item_index pointing at *item*.
-
-        ``WorkerInteractor.pytest_runtest_logreport`` asserts (and serializes)
-        ``session.items[self.item_index].nodeid == report.nodeid``. For the
-        incoming item that index is already correct, but reports for a
-        drained deferred item are forwarded while a *different* item is
-        current — so temporarily repoint the index.
-        """
-        interactor = self._get_interactor(item)
-        if interactor is None:
-            _log_reports(item, reports)
-            return
-        saved = interactor.item_index
-        try:
-            interactor.item_index = item.session.items.index(item)
-            _log_reports(item, reports)
-        finally:
-            interactor.item_index = saved
-
-    def _attempt(self, item, nextitem) -> None:
-        """Run item; either log its reports or stash it as deferred."""
-        n = self.attempts.get(item.nodeid, 0) + 1
-        self.attempts[item.nodeid] = n
-        pending_sha, reports = _run_protocol(item, nextitem, force_sync=n > _MAX_ATTEMPTS)
-        if pending_sha:
-            self.deferred.append((item, pending_sha))
-            self.defer_count += 1
-            _log_deferred_teardown_errors(item, reports, self._log_reports_as)
-        else:
-            self._log_reports_as(item, reports)
-
-    def _drain_ready(self, nextitem, force: bool = False) -> None:
-        """Re-run any deferred items whose compile finished (or failed).
-
-        ``force=True`` attempts still-pending items too — the wedge escape:
-        the caller has already pushed their attempt counts past
-        ``_MAX_ATTEMPTS``, so ``_attempt`` runs them with the pool suppressed
-        instead of trusting a sha that may never resolve.
-        """
-        pending = self.deferred
-        self.deferred = []
-        for item, sha in pending:
-            state, _ = self.pool.poll(sha)
-            if state == "pending" and not force:
-                self.deferred.append((item, sha))
-            else:
-                self._attempt(item, nextitem)  # may re-append to self.deferred
-
-    @pytest.hookimpl(tryfirst=True)
-    def pytest_runtest_protocol(self, item, nextitem):
-        # Retry any ready deferred items first. nextitem correctness is
-        # handled centrally by _run_protocol's misprediction guard.
-        self._drain_ready(nextitem=item)
-        self._attempt(item, nextitem)
-        return True  # protocol handled; suppress the default impl
-
-    @pytest.hookimpl(hookwrapper=True)
+    @pytest.hookimpl(wrapper=True)
     def pytest_runtestloop(self, session):
-        outcome = yield  # xdist WorkerInteractor loop: all assigned items
-        if outcome.excinfo is not None:
+        result = yield  # an aborted loop (-x, ^C, collection errors) raises past this
+        # Retry the tests still deferred (an xdist worker's channel is still
+        # open). Not after a stop: an xdist worker's loop ends normally then,
+        # and running more tests would only delay shutdown.
+        while self.deferred and not _stopped(session):
+            if not self._retry_ready(nextitem=None):
+                time.sleep(0.2)  # everything left is waiting on the pool
+        return result
+
+    def _retry_ready(self, nextitem) -> bool:
+        """Retry the deferred tests whose kernel is no longer pending, or has
+        been pending past the wedge deadline. Returns whether any ran."""
+        waiting, self.deferred = self.deferred, []
+        ran = False
+        for item, sha, deadline in waiting:
+            pending = self.pool.poll(sha)[0] == "pending"
+            if (pending and time.monotonic() <= deadline) or _stopped(item.session):
+                self.deferred.append((item, sha, deadline))
+                continue
+            self._teardown_if_mispredicted(item)
+            self.retrying, self.wedged = True, pending
+            try:
+                item.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
+            finally:
+                self.retrying = self.wedged = False
+            ran = True
+        return ran
+
+    def _teardown_if_mispredicted(self, item) -> None:
+        """pytest scopes fixture teardown to the next item an attempt predicts
+        (its nextitem; SetupState.teardown_exact), and asserts the prediction
+        at the next setup ("previous item was not torn down properly"). A
+        retry breaks the chain, so tear down fully before ``item`` runs, on
+        behalf of the last test run: plain pytest runs these finalizers in its
+        teardown, so their warnings and errors are reported under it. (Not
+        through its teardown hooks: its protocol is over, and plugins' hooks
+        may expect what that dropped, e.g. ``item.funcargs``.)"""
+        ss = item.session._setupstate
+        if self.predicted_next is item or not ss.stack:
             return
-        if session.shouldstop or session.shouldfail:
-            # -x / --maxfail / master-initiated stop: the session is being
-            # aborted; running deferred tests now would both delay shutdown
-            # and report tests "after" the stop point. Drop them (the master
-            # already considers them complete; the run is failing anyway).
-            self.deferred.clear()
-            return
+        last = self.last_run
+        with _warnings_of(last):
+            call = pytest.CallInfo.from_call(
+                lambda: ss.teardown_exact(None),
+                when="teardown",
+                reraise=get_reraise_exceptions(last.config),
+            )
+        if call.excinfo is not None:
+            report = pytest.TestReport.from_item_and_call(last, call)
+            report.sections = []  # its captured output went with its own reports
+            self._log(last, [report])
 
-        # Drain remaining deferred items, blocking on the pool. The channel
-        # to the master is still open, so reports flow normally.
-        deadline = time.monotonic() + self._WEDGE_TIMEOUT_S
-        wedged = False
-        while self.deferred:
-            before = len(self.deferred)
-            self._drain_ready(nextitem=None, force=wedged)
-            if self.deferred and len(self.deferred) == before:
-                if time.monotonic() > deadline:
-                    # Pool wedged: stop trusting "pending" and force the
-                    # remaining items through in-process. force is essential:
-                    # a permanently-pending sha (hung pool worker holding the
-                    # flock) is otherwise skipped by _drain_ready forever and
-                    # the attempts bump alone never takes effect — that
-                    # deadlocked every xdist worker until the CI job timeout.
-                    wedged = True
-                    for item, _ in self.deferred:
-                        self.attempts[item.nodeid] = _MAX_ATTEMPTS + 1
-                    continue
-                time.sleep(0.2)
+    @functools.cached_property
+    def _xdist_worker(self):
+        """xdist's WorkerInteractor (it registers itself as a plugin), or None."""
+        plugins = self.config.pluginmanager.get_plugins()
+        return next((p for p in plugins if type(p).__name__ == "WorkerInteractor"), None)
+
+    def _log(self, item, reports) -> None:
+        worker = self._xdist_worker
+        if worker is not None:
+            # WorkerInteractor.pytest_runtest_logreport asserts (and
+            # serializes) session.items[item_index].nodeid == report.nodeid,
+            # and a retried item's reports are logged while another is current.
+            saved, worker.item_index = worker.item_index, item.session.items.index(item)
+        try:
+            item.ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
+            for report in reports:
+                item.ihook.pytest_runtest_logreport(report=report)
+            item.ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
+        finally:
+            if worker is not None:
+                worker.item_index = saved
 
 
-# --- Session-end report-integrity check --------------------------------------
+# --- Session-end reporting ----------------------------------------------------
 #
-# The defer machinery reports an xdist item's protocol as complete *before*
+# Pool misses: the kernels the active pool did not compile, attached to a
+# test's last report and gathered where reports are logged.
+#
+# Report integrity: the defer machinery reports an xdist item's protocol as complete *before*
 # its reports are sent (that's what keeps the master streaming new items to
 # the worker). The one integrity hole this opens: a worker that crashes with
 # deferred items still stashed loses them SILENTLY — the master already
@@ -725,8 +624,8 @@ def pytest_sessionfinish(session, exitstatus):
         return
     if config.getoption("--async-compile-strict") and _fallbacks_by_test and exitstatus == 0:
         session.exitstatus = 1  # the terminal summary names the kernels and tests
-    if exitstatus not in (0, 1):
-        return  # interrupted (-x, ^C, internal error): missing reports expected
+    if exitstatus not in (0, 1) or session.shouldfail or session.shouldstop:
+        return  # stopped early (-x, ^C, internal error): missing reports expected
     missing = {item.nodeid for item in session.items} - _reported_nodeids - _deselected_nodeids
     if not missing:
         return

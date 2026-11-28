@@ -151,7 +151,8 @@ def through_pool(tmp_path, monkeypatch):
     set aside meanwhile (another test may have compiled the same kernel in
     this process). Returns ``(call's result, kernels the pool submitted)``;
     fails if any kernel compiled in-process instead (a refused submit, a
-    failed worker, an unloadable ``.o``)."""
+    failed worker, an unloadable ``.o``), or if the pool finishes no compile
+    for ``timeout`` seconds."""
     import time
     import warnings
 
@@ -170,13 +171,21 @@ def through_pool(tmp_path, monkeypatch):
                 before, n_fallbacks = pool.n_submitted, len(async_compile._fallbacks)
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
-                    deadline = time.monotonic() + timeout
+                    # Time out only while the pool makes no progress: these
+                    # kernels queue behind every compile submitted before
+                    # them, which on a cold, loaded run outlasts any fixed
+                    # budget.
+                    done, stalled_since = pool.stats()["done"], time.monotonic()
                     while True:
                         try:
                             result = call()
                             break
                         except async_compile.CompilePending:
-                            assert time.monotonic() < deadline, "compile never completed"
+                            if (now_done := pool.stats()["done"]) != done:
+                                done, stalled_since = now_done, time.monotonic()
+                            assert time.monotonic() - stalled_since < timeout, (
+                                f"the pool finished no compile in {timeout} s"
+                            )
                             time.sleep(0.2)
                 failed = [
                     str(w.message) for w in caught if "async compile failed" in str(w.message)
@@ -238,7 +247,7 @@ def pytest_runtest_call(item):
       being deferred and retried once its ``.o`` landed.
 
     Hence the shape below: ``CompilePending`` is handed to the defer
-    machinery exactly the way ``_defer_if_compile_pending`` would
+    machinery exactly the way the plugin's ``pytest_runtest_call`` does
     (``_quack_pending_sha`` + force-pass; the defer loop discards this
     attempt's reports and re-runs the test later), and any other retry
     exception — including a second OOM — becomes the recorded outcome via
@@ -262,7 +271,8 @@ def pytest_runtest_call(item):
             if isinstance(e, CompilePending):
                 from quack.testing.pytest_plugin import _defer_compile_pending_call
 
-                _defer_compile_pending_call(item, outcome, e)
+                _defer_compile_pending_call(item, e)
+                outcome.force_result(None)
             else:
                 # Real retry failure: report it through the outcome instead
                 # of raising out of the teardown (see docstring).
