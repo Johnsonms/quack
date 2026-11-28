@@ -64,7 +64,9 @@ class TopK:
         stream: cuda.CUstream,
     ):
         assert mX.element_type == self.dtype
-        assert mValues.element_type == self.dtype
+        # Values may be wider than the input (e.g. FP32 routing weights from BF16
+        # logits); the kernel computes in FP32 and converts on the final store.
+        assert mValues.element_type in (self.dtype, Float32)
         assert mIndices.element_type == Int32
         tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy()
         num_threads = tiled_copy.size
@@ -215,12 +217,14 @@ class TopK:
 
     @staticmethod
     @jit_cache
-    def compile(dtype, N, k, softmax):
+    def compile(dtype, N, k, softmax, values_dtype=None):
+        values_dtype = dtype if values_dtype is None else values_dtype
         batch_sym = cute.sym_int()
         div = math.gcd(128 // dtype.width, N)
         x_cute = fake_tensor(dtype, (batch_sym, N), div)
-        values_cute = fake_tensor(dtype, (batch_sym, k), div)
-        indices_cute = fake_tensor(Int32, (batch_sym, k), div)
+        # values / indices rows are k elements apart, so their alignment follows k, not N.
+        values_cute = fake_tensor(values_dtype, (batch_sym, k), math.gcd(128 // values_dtype.width, k))
+        indices_cute = fake_tensor(Int32, (batch_sym, k), math.gcd(128 // Int32.width, k))
         return cute.compile(
             TopK(dtype, N, k, softmax=softmax),
             x_cute,
@@ -249,24 +253,30 @@ def _topk_fwd(
     if x.numel() == 0:
         return
 
+    assert values.dtype in (x.dtype, torch.float32), "values must match x or be float32"
     N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
-    TopK.compile(dtype, N, k, softmax)(x, values, indices)
+    TopK.compile(dtype, N, k, softmax, torch2cute_dtype_map[values.dtype])(x, values, indices)
 
 
-def topk_fwd(x: torch.Tensor, k: int, softmax: bool = False):
+def topk_fwd(
+    x: torch.Tensor, k: int, softmax: bool = False, values_dtype: Optional[torch.dtype] = None
+):
     """Top-k operation.
 
     Args:
         x: Input tensor of shape (M, N)
         k: Number of top elements to return
         softmax: Whether to apply softmax to the top-k values
+        values_dtype: Dtype of the returned values: x.dtype (default) or torch.float32.
+            The kernel computes in FP32, so FP32 values cost nothing extra (useful for
+            MoE routing weights, which inference engines keep in FP32).
 
     Returns:
         Tuple of (values tensor of shape (M, k), indices tensor of shape (M, k))
     """
     M = x.size(0)
-    values = torch.empty((M, k), dtype=x.dtype, device=x.device)
+    values = torch.empty((M, k), dtype=values_dtype or x.dtype, device=x.device)
     indices = torch.empty((M, k), dtype=torch.int32, device=x.device)
     _topk_fwd(x, k, softmax, values, indices)
     return values, indices

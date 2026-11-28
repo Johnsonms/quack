@@ -134,3 +134,19 @@ def test_topk_bwd_empty():
     indices = torch.empty(0, k, device="cuda", dtype=torch.int32)
     dx = topk_bwd(dvalues, None, indices, N=N)
     assert dx.shape == (0, N)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("N,k", [(64, 4), (128, 8), (256, 8), (128, 2)])
+@pytest.mark.parametrize("M", [1, 37, 1024])
+def test_topk_fp32_values(M, N, k, input_dtype):
+    """FP32 values from 16-bit input: same indices as the default path, values equal
+    to the softmax of the top-k logits computed in FP32 (MoE routing weights)."""
+    torch.random.manual_seed(0)
+    x = torch.randn(M, N, device="cuda", dtype=input_dtype)
+    val, idx = topk_fwd(x, k, softmax=True, values_dtype=torch.float32)
+    assert val.dtype == torch.float32 and idx.dtype == torch.int32
+    _, idx_ref = topk_fwd(x, k, softmax=True)
+    torch.testing.assert_close(idx.sort(-1)[0], idx_ref.sort(-1)[0])
+    ref = torch.softmax(torch.gather(x.float(), 1, idx.long()), dim=-1)
+    torch.testing.assert_close(val, ref, atol=1e-6, rtol=1e-5)
